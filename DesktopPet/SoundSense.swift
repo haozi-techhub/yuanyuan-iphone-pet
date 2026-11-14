@@ -1,6 +1,7 @@
 @preconcurrency import AVFoundation
 import Foundation
 import Observation
+import os
 @preconcurrency import Speech
 
 @MainActor
@@ -17,7 +18,7 @@ final class SoundSense {
     @ObservationIgnored var onVoiceInterrupted: (() -> Void)?
     @ObservationIgnored var onEffectInterrupted: (() -> Void)?
 
-    @ObservationIgnored private let engine = AVAudioEngine()
+    @ObservationIgnored private var engine = AVAudioEngine()
     @ObservationIgnored private var permissionTask: Task<Void, Never>?
     @ObservationIgnored private var interruptionTask: Task<Void, Never>?
     @ObservationIgnored private var enabled = false
@@ -63,12 +64,34 @@ final class SoundSense {
         return AVAudioApplication.shared.recordPermission == .granted
     }
 
-    func startVoiceCapture(_ request: SFSpeechAudioBufferRecognitionRequest) throws {
+    func startVoiceCapture(_ request: SFSpeechAudioBufferRecognitionRequest,
+                           onLevel: (@Sendable (Double) -> Void)? = nil) throws {
+        try startVoiceCapture { _ in
+            Self.recognitionTap(onLevel: onLevel) { request.append($0) }
+        }
+    }
+
+    func startVoiceCapture(packets: AsyncStream<Data>.Continuation,
+                           onLevel: (@Sendable (Double) -> Void)?) throws {
+        try startVoiceCapture { format in
+            guard let pcm = AVAudioFormat(commonFormat: .pcmFormatInt16,
+                                          sampleRate: Double(DoubaoVoiceClient.sampleRate),
+                                          channels: 1, interleaved: false),
+                  let converter = AVAudioConverter(from: format, to: pcm) else {
+                throw AudioError.unavailable
+            }
+            return Self.recognitionTap(onLevel: onLevel, consume: Self.pcmBufferConsumer(converter, packets: packets))
+        }
+    }
+
+    private func startVoiceCapture(makeTap: (AVAudioFormat) throws -> AVAudioNodeTapBlock) throws {
         guard !effectActive else { throw AudioError.unavailable }
         voiceActive = true
         resetDetector()
         stopInput()
-        try startInput(tap: Self.recognitionTap(request))
+        // Rebuild the input graph after playback may have changed the hardware format.
+        engine = AVAudioEngine()
+        try startInput(makeTap: makeTap)
     }
 
     func stopVoiceCapture() {
@@ -156,6 +179,10 @@ final class SoundSense {
     }
 
     private func startInput(tap: @escaping AVAudioNodeTapBlock) throws {
+        try startInput { _ in tap }
+    }
+
+    private func startInput(makeTap: (AVAudioFormat) throws -> AVAudioNodeTapBlock) throws {
         guard !interrupted else { throw AudioError.unavailable }
         observeInterruptions()
         let session = AVAudioSession.sharedInstance()
@@ -168,7 +195,7 @@ final class SoundSense {
         let node = engine.inputNode
         let format = node.outputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else { throw AudioError.unavailable }
-        node.installTap(onBus: 0, bufferSize: 512, format: format, block: tap)
+        node.installTap(onBus: 0, bufferSize: 512, format: format, block: try makeTap(format))
         hasInputTap = true
         engine.prepare()
         try engine.start()
@@ -213,9 +240,56 @@ final class SoundSense {
     private enum AudioError: Error { case unavailable }
 
     private nonisolated static func recognitionTap(
-        _ request: SFSpeechAudioBufferRecognitionRequest
+        onLevel: (@Sendable (Double) -> Void)?,
+        consume: @escaping (AVAudioPCMBuffer) -> Void
     ) -> AVAudioNodeTapBlock {
-        { buffer, _ in request.append(buffer) }
+        var frames = 0
+        var peakPower = 0.0
+        return { buffer, _ in
+            consume(buffer)
+            guard let onLevel, let channel = buffer.floatChannelData?.pointee else { return }
+            let count = Int(buffer.frameLength)
+            guard count > 0 else { return }
+            var power = 0.0
+            for index in 0..<count {
+                let value = channel[index * buffer.stride]
+                power += Double(value * value)
+            }
+            peakPower = max(peakPower, power / Double(count))
+            frames += count
+            if Double(frames) >= buffer.format.sampleRate * 0.05 {
+                onLevel(10 * log10(max(peakPower, 0.00000001)))
+                frames = 0
+                peakPower = 0
+            }
+        }
+    }
+
+    private nonisolated static func pcmBufferConsumer(
+        _ converter: AVAudioConverter, packets: AsyncStream<Data>.Continuation
+    ) -> (AVAudioPCMBuffer) -> Void {
+        return { buffer in
+            let ratio = converter.outputFormat.sampleRate / buffer.format.sampleRate
+            let capacity = AVAudioFrameCount(ceil(Double(buffer.frameLength) * ratio)) + 32
+            guard let output = AVAudioPCMBuffer(pcmFormat: converter.outputFormat, frameCapacity: capacity) else { return }
+            let provided = OSAllocatedUnfairLock(initialState: false)
+            var error: NSError?
+            let status = converter.convert(to: output, error: &error) { _, inputStatus in
+                let alreadyProvided = provided.withLock { value in
+                    let previous = value
+                    value = true
+                    return previous
+                }
+                if alreadyProvided {
+                    inputStatus.pointee = .noDataNow
+                    return nil
+                }
+                inputStatus.pointee = .haveData
+                return buffer
+            }
+            guard status != .error, output.frameLength > 0, let samples = output.int16ChannelData?.pointee else { return }
+            packets.yield(Data(bytes: samples, count: Int(output.frameLength) * MemoryLayout<Int16>.size))
+        }
     }
 
     private nonisolated static func ambientTap(

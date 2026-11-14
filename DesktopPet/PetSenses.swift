@@ -5,7 +5,7 @@ import Vision
 
 enum PetStimulus: Sendable {
     case faceReturned, faceLost, searching
-    case wave, thumbsUp, heart
+    case wave, closePalm, thumbsUp, heart
     case shake, faceDown, faceUp, pickedUp
     case clap, doubleClap, blow, musicStarted, musicStopped
 }
@@ -17,6 +17,7 @@ enum PetCameraStatus: Equatable {
 @Observable @MainActor
 final class PetSenses {
     var onEvent: ((PetStimulus) -> Void)?
+    var onVisionPlay: ((VisionPlayFrame) -> Void)?
     private(set) var isFaceDown = false
     private(set) var cameraStatus: PetCameraStatus = .inactive
     private(set) var motionUnavailable = false
@@ -37,6 +38,7 @@ final class PetSenses {
     @ObservationIgnored private var active = false
     @ObservationIgnored private var eyeTracking = false
     @ObservationIgnored private var handGestures = false
+    @ObservationIgnored private var visionPlayEnabled = false
     @ObservationIgnored private var suppressCamera = false
     @ObservationIgnored private var motionRunning = false
     @ObservationIgnored private var orientation: UIInterfaceOrientation = .portrait
@@ -65,11 +67,12 @@ final class PetSenses {
     }
 
     func configure(active: Bool, eyeTracking: Bool, handGestures: Bool, motionEnabled: Bool,
-                   suppressCamera: Bool = false) {
+                   suppressCamera: Bool = false, visionPlayEnabled: Bool = false) {
         self.active = active
         if self.eyeTracking != eyeTracking { resetFaceTracking() }
         self.eyeTracking = eyeTracking
         self.handGestures = handGestures
+        self.visionPlayEnabled = visionPlayEnabled
         self.suppressCamera = suppressCamera
 
         let shouldRunMotion = active && motionEnabled && motion.isAvailable
@@ -95,13 +98,14 @@ final class PetSenses {
         updateCamera()
     }
 
-    func setOrientation(_ orientation: UIInterfaceOrientation) {
-        guard orientation != .unknown, orientation != self.orientation else { return }
+    func setOrientation(_ orientation: UIInterfaceOrientation) -> Bool {
+        guard orientation != .unknown, orientation != self.orientation else { return false }
         self.orientation = orientation
         motion.orientation = orientation
         resetHandTracking()
         resetFaceTracking()
         updateCamera()
+        return true
     }
 
     func requestCameraPermission() {
@@ -171,7 +175,8 @@ final class PetSenses {
         let configuration = CameraConfiguration(
             orientation: orientation,
             tracksFaces: eyeTracking,
-            recognizesGestures: handGestures
+            recognizesGestures: handGestures,
+            visionPlayEnabled: visionPlayEnabled
         )
         guard configuration != cameraConfiguration else { return }
         if cameraConfiguration == nil { cameraStatus = .starting }
@@ -187,10 +192,11 @@ final class PetSenses {
                     self.resetHandTracking()
                     self.resetFaceTracking()
                 }
-            case .frame(let hand, let face, let checkedFace, let event, let timestamp):
+            case .frame(let hand, let face, let checkedFace, let event, let visionPlay, let timestamp):
                 if let hand { self.receiveHand(hand, at: timestamp) }
                 if checkedFace { self.receiveFace(face, at: timestamp) }
                 if let event, self.handGestures { self.onEvent?(event) }
+                if let visionPlay, self.visionPlayEnabled { self.onVisionPlay?(visionPlay) }
             }
         }
     }
@@ -288,6 +294,7 @@ private nonisolated struct CameraConfiguration: Equatable, Sendable {
     var orientation: UIInterfaceOrientation
     var tracksFaces: Bool
     var recognizesGestures: Bool
+    var visionPlayEnabled: Bool
 
     // The orientation API accounts for the physical sensor mount on different iPhones.
     var videoOrientation: AVCaptureVideoOrientation {
@@ -302,7 +309,8 @@ private nonisolated struct CameraConfiguration: Equatable, Sendable {
 
 private nonisolated enum CameraUpdate: Sendable {
     case availability(Bool)
-    case frame(hand: CGPoint?, face: CGPoint?, checkedFace: Bool, event: PetStimulus?, timestamp: TimeInterval)
+    case frame(hand: CGPoint?, face: CGPoint?, checkedFace: Bool, event: PetStimulus?,
+               visionPlay: VisionPlayFrame?, timestamp: TimeInterval)
 }
 
 // Capture configuration and all frame processing share this private serial queue.
@@ -316,6 +324,7 @@ private nonisolated final class CameraSense: NSObject, AVCaptureVideoDataOutputS
     private let handRequest = VNDetectHumanHandPoseRequest()
     private var framesUntilFace = 0
     private var gestures = GestureDetector()
+    private var visionPlay = VisionPlayDetector()
     private var handTracker = HandTracker()
 
     func configure(_ configuration: CameraConfiguration, onUpdate: @escaping @MainActor @Sendable (CameraUpdate) -> Void) {
@@ -323,6 +332,10 @@ private nonisolated final class CameraSense: NSObject, AVCaptureVideoDataOutputS
             if self.configuration?.orientation != configuration.orientation ||
                 self.configuration?.recognizesGestures != configuration.recognizesGestures {
                 self.gestures = GestureDetector()
+            }
+            if self.configuration?.orientation != configuration.orientation ||
+                self.configuration?.visionPlayEnabled != configuration.visionPlayEnabled {
+                self.visionPlay = VisionPlayDetector()
             }
             if self.configuration?.orientation != configuration.orientation {
                 self.handTracker = HandTracker()
@@ -408,8 +421,19 @@ private nonisolated final class CameraSense: NSObject, AVCaptureVideoDataOutputS
         let faceCenter = face.map { CGPoint(x: $0.midX, y: $0.midY) }
         let handPoints = (handRequest.results ?? []).compactMap { try? $0.recognizedPoints(.all) }
         let handCenter = handTracker.update(handPoints, at: now)
-        let event = configuration.recognizesGestures ? gestures.update(handPoints, at: now) : nil
-        report(.frame(hand: handCenter, face: faceCenter, checkedFace: checkFace, event: event, timestamp: now))
+        var event: PetStimulus?
+        var play: VisionPlayFrame?
+        if configuration.recognizesGestures {
+            let hands = handPoints.compactMap(GestureDetector.Hand.init)
+            let result = gestures.update(hands, at: now)
+            event = result.event
+            if configuration.visionPlayEnabled {
+                let pose = hands.count == 1 && !result.hasOtherGesture ? hands.first?.playPose : nil
+                play = visionPlay.update(pose, waving: result.waving, at: now)
+            }
+        }
+        report(.frame(hand: handCenter, face: faceCenter, checkedFace: checkFace, event: event,
+                      visionPlay: play, timestamp: now))
     }
 
     private func report(_ update: CameraUpdate) {
@@ -457,11 +481,12 @@ private extension CGRect {
 
 private nonisolated struct GestureDetector {
     private enum Gesture {
-        case wave, thumbsUp, heart
+        case wave, closePalm, thumbsUp, heart
 
         var event: PetStimulus {
             switch self {
             case .wave: .wave
+            case .closePalm: .closePalm
             case .thumbsUp: .thumbsUp
             case .heart: .heart
             }
@@ -473,9 +498,10 @@ private nonisolated struct GestureDetector {
     private var lastReported: Gesture?
     private var lastReportedAt: TimeInterval = 0
     private var wave = WaveDetector()
+    private var palmClose = PalmCloseDetector()
 
-    mutating func update(_ points: [HandPoints], at time: TimeInterval) -> PetStimulus? {
-        let hands = points.compactMap(Hand.init)
+    mutating func update(_ hands: [Hand], at time: TimeInterval)
+        -> (event: PetStimulus?, waving: Bool, hasOtherGesture: Bool) {
         let waving = wave.update(hands.filter(\.isOpen), at: time)
         let detected: Gesture?
         if hands.count == 2, hands[0].formsHeart(with: hands[1]) {
@@ -486,24 +512,36 @@ private nonisolated struct GestureDetector {
             detected = waving ? .wave : nil
         }
 
+        // A palm closing is a transition; it can't be debounced like a held pose.
+        let closedPalm = palmClose.update(detected == nil && hands.count == 1 ? hands.first : nil, at: time)
+        if closedPalm, time - lastReportedAt >= 1.5 {
+            lastReported = .closePalm
+            lastReportedAt = time
+            return (.closePalm, waving, true)
+        }
+
         if detected == candidate {
             consecutiveFrames += 1
         } else {
             candidate = detected
             consecutiveFrames = 1
         }
-        guard consecutiveFrames >= 3 else { return nil }
-        guard let detected else {
-            lastReported = nil
-            return nil
+        var event: PetStimulus?
+        if consecutiveFrames >= 3 {
+            if let detected {
+                if detected != lastReported, time - lastReportedAt >= 1.5 {
+                    lastReported = detected
+                    lastReportedAt = time
+                    event = detected.event
+                }
+            } else if !hands.contains(where: \.isOpen) || lastReported != .wave {
+                lastReported = nil
+            }
         }
-        guard detected != lastReported, time - lastReportedAt >= 1.5 else { return nil }
-        lastReported = detected
-        lastReportedAt = time
-        return detected.event
+        return (event, waving, detected == .heart || detected == .thumbsUp)
     }
 
-    private struct Hand {
+    struct Hand {
         private let points: HandPoints
         let wrist: CGPoint
         let scale: CGFloat
@@ -533,6 +571,37 @@ private nonisolated struct GestureDetector {
             }
         }
 
+        var isFiveFingerPalm: Bool {
+            guard isOpen, let thumb = point(.thumbTip) else { return false }
+            return Self.fingers.allSatisfy { tip, _ in
+                guard let tip = point(tip) else { return false }
+                return thumb.distance(to: tip) > scale * 0.65
+            }
+        }
+
+        var isClosed: Bool {
+            guard let thumb = point(.thumbTip) else { return false }
+            let curledTips = Self.fingers.compactMap { tip, joint -> CGPoint? in
+                guard let tip = point(tip), let joint = point(joint),
+                      wrist.distance(to: tip) < wrist.distance(to: joint) + scale * 0.23 else { return nil }
+                return tip
+            }
+            // Check the fingertips converge around the thumb, including a loose pinch.
+            // One fingertip can be hidden or lag behind as the hand closes.
+            return curledTips.filter { $0.distance(to: thumb) < scale * 0.70 }.count >= 3
+        }
+
+        var playPose: VisionPlayDetector.Pose? {
+            if isOpen { return .palm(wrist: wrist, scale: scale) }
+            guard let tip = point(.indexTip), let joint = point(.indexPIP),
+                  wrist.distance(to: tip) > wrist.distance(to: joint) + scale * 0.25 else { return nil }
+            let othersCurled = Self.fingers.dropFirst().allSatisfy { tip, joint in
+                guard let tip = point(tip), let joint = point(joint) else { return false }
+                return wrist.distance(to: tip) < wrist.distance(to: joint) + scale * 0.12
+            }
+            return othersCurled ? .pointing(tip) : nil
+        }
+
         var isThumbsUp: Bool {
             guard let thumb = point(.thumbTip), let thumbJoint = point(.thumbMP),
                   thumb.y - thumbJoint.y > scale * 0.34 else { return false }
@@ -553,6 +622,39 @@ private nonisolated struct GestureDetector {
                 thumb.distance(to: otherThumb) < size * 0.58 &&
                 indexY - thumbY > size * 0.30 &&
                 wrist.distance(to: other.wrist) > size
+        }
+    }
+
+    private struct PalmCloseDetector {
+        private var anchor: CGPoint?
+        private var openFrames = 0
+        private var closedFrames = 0
+        private var lastOpenAt: TimeInterval = 0
+
+        mutating func update(_ hand: Hand?, at time: TimeInterval) -> Bool {
+            guard let hand else {
+                self = Self()
+                return false
+            }
+            if let anchor, anchor.distance(to: hand.wrist) > max(0.08, hand.scale * 0.9)
+                || time - lastOpenAt > 0.85 {
+                self = Self()
+            }
+            if hand.isFiveFingerPalm {
+                if anchor == nil { anchor = hand.wrist }
+                openFrames = min(openFrames + 1, 2)
+                closedFrames = 0
+                lastOpenAt = time
+                return false
+            }
+            guard openFrames >= 2 else {
+                self = Self()
+                return false
+            }
+            closedFrames = hand.isClosed ? closedFrames + 1 : 0
+            guard closedFrames >= 2 else { return false }
+            self = Self()
+            return true
         }
     }
 

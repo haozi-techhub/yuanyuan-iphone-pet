@@ -21,6 +21,8 @@ struct PetScreen: View {
     @AppStorage("pet.showSettingsButton") private var showSettingsButton = false
     @AppStorage("pet.showVoiceButton") private var showVoiceButton = false
     @AppStorage("pet.showPetCaption") private var showPetCaption = true
+    @AppStorage("pet.proactiveGreetings") private var proactiveGreetings = true
+    @AppStorage("pet.lastGreetingAt") private var lastGreetingAt: Double = 0
     @AppStorage("pet.keepAwake") private var keepAwake = false
     @AppStorage("pet.showMouth") private var showMouth = false
     @AppStorage("pet.mode") private var mode: PetMode = .normal
@@ -37,13 +39,19 @@ struct PetScreen: View {
     @AppStorage("pet.customPersonality") private var customPersonality = ""
     @State private var director = PetDirector()
     @State private var showControls = false
+    @AppStorage("pet.visionEnabled") private var visionEnabled = false
+    @State private var messageAlertID: UUID?
     @State private var activityPath: [ActivityPage] = []
     @State private var pendingExpression: PetExpression?
     @State private var pendingExpressionShow: PetExpressionShow?
+    @State private var pendingPlayActivity: PetDirector.PlayActivity?
     @State private var pendingMarch = false
     @State private var expressionSoundPreviewFailed = false
-    @State private var keyInput = ""
-    @State private var keyMessage: String?
+    @State private var keyInputs: [KeychainStore.Account: String] = [:]
+    @State private var keyMessages: [KeychainStore.Account: String] = [:]
+    @State private var checkingKey: KeychainStore.Account?
+    @State private var keyCheckTask: Task<Void, Never>?
+    @GestureState private var faceDragActive = false
     @GestureState private var micHeld = false
     @State private var micStarted = false
 
@@ -58,7 +66,7 @@ struct PetScreen: View {
 
     private var settings: PetDirector.Settings {
         PetDirector.Settings(mode: mode, nightLightMinutes: nightLightMinutes, keepAwake: keepAwake,
-                             eyeTracking: eyeTracking, handGestures: handGestures, motion: motion, sound: sound,
+                             eyeTracking: eyeTracking, handGestures: handGestures, visionEnabled: visionEnabled, motion: motion, sound: sound,
                              foreground: scenePhase == .active, background: scenePhase == .background,
                              controlsOpen: showControls, expressionSoundsEnabled: expressionSounds,
                              focusing: director.focusTimer.isFocusing)
@@ -121,13 +129,20 @@ struct PetScreen: View {
                                 mouthEnabled: showMouth || director.isPlayingMarch, motionEnabled: !reduceMotion,
                                 eyeTint: expressionShowActive ? nil : director.modes.eyeTint,
                                 batteryLevel: isActing || isPreviewing ? nil : director.modes.batteryLevel,
-                                drawingSize: art, centerOffset: centerOffset)
+                                drawingSize: art, showsBubbleDecoration: director.playSession?.activity != .bubbles,
+                                centerOffset: centerOffset)
                             .allowsHitTesting(false)
 
-                        interactionArea(expression: expression, isPreviewing: isPreviewing, isActing: isActing)
+                        interactionArea(expression: expression, isPreviewing: isPreviewing, isActing: isActing,
+                                        pose: pose, drawingSize: art, centerOffset: centerOffset)
+                        if let session = director.playSession {
+                            playTargets(session, at: now, in: geometry.size)
+                        }
                     }
                     .overlay(alignment: .bottom) {
-                        captions(for: expression, variant: variant, isPreviewing: isPreviewing, isPerforming: isPerforming)
+                        if director.playSession == nil {
+                            captions(for: expression, variant: variant, isPreviewing: isPreviewing, isPerforming: isPerforming)
+                        }
                     }
                 }
 
@@ -138,15 +153,29 @@ struct PetScreen: View {
                 .padding(.horizontal, 20)
                 .padding(.top, 8)
 
+                if showsConversation {
+                    conversationBubble
+                        .frame(maxWidth: 540)
+                        .padding(.horizontal, portrait ? 20 : 112)
+                        .padding(.top, portrait ? 58 : 8)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                }
+
+                if director.playSession != nil {
+                    headerButton("退出互动", symbol: "xmark", action: director.endPlay)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+                        .padding(16)
+                }
+
                 if director.isPlayingMarch {
                     headerButton("停止唱歌", symbol: "stop.fill", action: director.stopMarch)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
                         .padding(16)
-                } else if voiceAvailable && showVoiceButton && (!director.voice.isCapturingSpeech || micStarted) {
-                    microphoneControl
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+                } else if voiceAvailable && !showControls {
+                    conversationControls
                         .padding(.trailing, 20)
-                        .padding(.bottom, 10)
+                        .padding(.bottom, 14)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
                 }
             }
             .onChange(of: geometry.size, initial: true) { _, _ in director.updateOrientation() }
@@ -158,8 +187,22 @@ struct PetScreen: View {
                 .preferredColorScheme(.dark)
                 .presentationDragIndicator(.visible)
         }
+        .onOpenURL { url in
+            guard url.absoluteString == "yuanyuan-pet://message-received" else { return }
+            messageAlertID = UUID()
+        }
+        .task(id: messageAlertID) {
+            guard messageAlertID != nil else { return }
+            do {
+                try await Task.sleep(for: .seconds(8))
+            } catch {
+                return
+            }
+            messageAlertID = nil
+        }
         .statusBarHidden()
         .onChange(of: settings, initial: true) { _, value in director.configure(value) }
+        .onChange(of: director.senses.cameraStatus) { _, _ in director.visionCameraStatusChanged() }
         .onChange(of: wakeSettings, initial: true) { _, value in
             director.voice.configureWake(enabled: value.enabled, model: value.model,
                                          name: value.name, personality: value.personality)
@@ -173,8 +216,11 @@ struct PetScreen: View {
             if !showing {
                 activityPath.removeAll()
                 director.voice.stopPreview()
-                keyInput = ""
-                keyMessage = nil
+                keyCheckTask?.cancel()
+                keyCheckTask = nil
+                checkingKey = nil
+                keyInputs.removeAll()
+                keyMessages.removeAll()
             }
         }
         .task {
@@ -188,9 +234,21 @@ struct PetScreen: View {
                 try? await Task.sleep(for: .milliseconds(200))
             }
         }
+        .task(id: scenePhase == .active && proactiveGreetings) {
+            guard scenePhase == .active, proactiveGreetings else { return }
+            do {
+                try await Task.sleep(for: .seconds(4))
+                while !Task.isCancelled {
+                    showGreetingIfDue()
+                    try await Task.sleep(for: .seconds(5))
+                }
+            } catch {}
+        }
         .onDisappear {
-            director.voice.onReply = nil
+            director.voice.onReplyExpression = nil
+            director.voice.onCommand = nil
             director.voice.batteryStatusReply = nil
+            director.onVoiceGesture = nil
             director.voice.onMarchRequested = nil
             director.voice.configureWake(enabled: false, model: model, name: displayName, personality: selectedPersonality)
             director.stop()
@@ -198,8 +256,13 @@ struct PetScreen: View {
     }
 
     private func playPendingSelection() {
-        guard pendingMarch || pendingExpressionShow != nil || pendingExpression != nil else { return }
+        guard pendingPlayActivity != nil || pendingMarch || pendingExpressionShow != nil || pendingExpression != nil else { return }
         director.configure(settings)
+        if let activity = pendingPlayActivity {
+            pendingPlayActivity = nil
+            director.startPlay(activity)
+            return
+        }
         if pendingMarch {
             pendingMarch = false
             director.playMarch()
@@ -213,6 +276,35 @@ struct PetScreen: View {
         guard let expression = pendingExpression else { return }
         pendingExpression = nil
         director.show(expression)
+    }
+
+    private var canShowGreeting: Bool {
+        proactiveGreetings && scenePhase == .active && !showControls && director.canOfferGreeting
+    }
+
+    private var showsConversation: Bool {
+        guard !showControls, voiceAvailable, !director.isPlayingMarch else { return false }
+        return director.visionHint != nil || messageAlertID != nil || director.voice.replyText != nil || director.voice.status != nil
+    }
+
+    private var conversationBubble: some View {
+        let voice = director.voice
+        return PetConversationBubble(
+            name: displayName,
+            transcript: voice.transcript,
+            message: voice.replyText ?? director.visionHint ?? (messageAlertID == nil ? nil : "你有一条新消息"),
+            status: voice.status
+        )
+    }
+
+    private func showGreetingIfDue() {
+        guard canShowGreeting, !showsConversation else { return }
+        let now = Date()
+        let previous = lastGreetingAt == 0 ? nil : Date(timeIntervalSince1970: lastGreetingAt)
+        guard let text = PetGreetingPeriod.greeting(at: now, after: previous) else { return }
+        lastGreetingAt = now.timeIntervalSince1970
+        director.prepareForVoiceInput()
+        director.voice.announceGreeting(text)
     }
 
     @ViewBuilder
@@ -309,7 +401,7 @@ struct PetScreen: View {
     }
 
     private func faceOffset(_ travel: CGPoint, in size: CGSize, art: CGSize, portrait: Bool) -> CGSize {
-        // Reserve space for both eyes and leave the controls and subtitle readable at the edges.
+        // Keep the eyes inside the screen and clear of the controls.
         CGSize(width: travel.x * max(0, size.width / 2 - art.width * 0.26 - 12),
                height: travel.y * max(0, size.height / 2 - art.height * 0.30 - (portrait ? 36 : 16)))
     }
@@ -341,16 +433,6 @@ struct PetScreen: View {
         .ignoresSafeArea()
         .allowsHitTesting(false)
         .accessibilityHidden(true)
-    }
-
-    private var voiceStatus: String? {
-        if let caption = director.voice.caption { return caption }
-        switch director.voice.phase {
-        case .authorizing: return "正在准备语音"
-        case .listening: return nil
-        case .thinking: return "正在想怎么回复…"
-        case .idle, .speaking: return nil
-        }
     }
 
     private func captions(for expression: PetExpression, variant: PetExpressionVariant,
@@ -387,10 +469,10 @@ struct PetScreen: View {
             return title
         }
         if director.isPlayingMarch { return "圆圆进行曲" }
-        if let status = voiceStatus ?? director.notice ?? director.countdownText() ?? director.modes.caption {
+        if let status = director.notice ?? director.countdownText() ?? director.modes.caption {
             return status
         }
-        guard showPetCaption else { return nil }
+        guard showPetCaption, !showsConversation else { return nil }
         if expression == .idle, director.focusTimer.isFocusing { return nil }
         if expression == .idle, director.voice.isWaitingForWake {
             return "说「嘿，\(displayName)」唤醒"
@@ -402,8 +484,67 @@ struct PetScreen: View {
 
     private var voiceAvailable: Bool { !expressionShowActive && mode != .nightLight && !director.senses.isFaceDown }
 
-    private var canEndVoice: Bool {
-        director.voice.phase == .listening || director.voice.phase == .authorizing
+    private var canStopVoice: Bool {
+        !director.voice.canRecord && !director.voice.isPreviewing
+    }
+
+    private var conversationControls: some View {
+        HStack(spacing: 10) {
+            if showsConversation && director.voice.canRecord && director.visionHint == nil {
+                if director.voice.replyText != nil {
+                    headerButton("重播回复", symbol: "speaker.wave.2") {
+                        director.voice.replayReply()
+                    }
+                }
+                headerButton("关闭对话气泡", symbol: "xmark") {
+                    messageAlertID = nil
+                    director.voice.dismissConversation()
+                }
+            }
+            if showVoiceButton && (director.canUseVoice || micStarted) {
+                microphoneControl
+            }
+            if !director.focusTimer.isFocusing { visionControl }
+            Button(action: toggleConversation) {
+                Image(systemName: canStopVoice ? "xmark" : "mic.fill")
+                    .font(.system(size: 23, weight: .semibold))
+                    .frame(width: 60, height: 60)
+                    .background(canStopVoice ? AnyShapeStyle(Color.red.opacity(0.28)) : AnyShapeStyle(.ultraThinMaterial),
+                                in: Circle())
+                    .overlay { Circle().strokeBorder(.white.opacity(0.18), lineWidth: 1) }
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(canStopVoice ? "结束对话" : "开始说话")
+            .disabled(!canStopVoice && !director.canUseVoice)
+        }
+    }
+
+    private var visionControl: some View {
+        let active = visionEnabled && director.senses.cameraStatus == .active
+        let status = if !visionEnabled { "已关闭" } else {
+            switch director.senses.cameraStatus {
+            case .active: "前置相机已开启"
+            case .denied: "相机权限未开启"
+            case .unavailable: "相机暂不可用"
+            case .thermal: "设备过热，已暂停"
+            case .inactive: "前置相机已暂停"
+            case .starting: "前置相机正在开启"
+            }
+        }
+        return Button {
+            visionEnabled.toggle()
+        } label: {
+            Image(systemName: active ? "eye.fill" : "eye")
+                .font(.system(size: 22, weight: .semibold))
+                .foregroundStyle(active ? Color.cyan : Color.white)
+                .frame(width: 60, height: 60)
+                .background(active ? AnyShapeStyle(Color.cyan.opacity(0.17)) : AnyShapeStyle(.ultraThinMaterial),
+                            in: Circle())
+                .overlay { Circle().strokeBorder(active ? .cyan.opacity(0.5) : .white.opacity(0.18)) }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(visionEnabled ? "关闭隔空互动" : "开启隔空互动")
+        .accessibilityValue(status)
     }
 
     private var microphoneControl: some View {
@@ -427,15 +568,15 @@ struct PetScreen: View {
                     }
                     .onEnded { _ in endMicHold() }
             )
-            .accessibilityLabel(canEndVoice ? "发送语音" : "按住说话")
-            .accessibilityHint("轻点两次开始说话，再轻点两次发送")
+            .accessibilityLabel("按住说话")
+            .accessibilityHint("轻点两次开启或结束连续对话")
             .accessibilityAddTraits(.isButton)
-            .accessibilityAction { toggleVoice() }
+            .accessibilityAction { toggleConversation() }
     }
 
-    private func toggleVoice() {
-        if canEndVoice {
-            director.voice.end()
+    private func toggleConversation() {
+        if canStopVoice {
+            director.voice.cancel()
         } else {
             beginVoice(pushToTalk: false)
         }
@@ -444,7 +585,11 @@ struct PetScreen: View {
     private func beginVoice(pushToTalk: Bool = true) {
         guard director.canUseVoice else { return }
         director.prepareForVoiceInput()
-        director.voice.begin(model: model, name: displayName, personality: selectedPersonality, pushToTalk: pushToTalk)
+        let activeGreeting = director.voice.replyText.flatMap { text in
+            [PetGreetingPeriod.morning.greeting, PetGreetingPeriod.lunch.greeting].contains(text) ? text : nil
+        }
+        director.voice.begin(model: model, name: displayName, personality: selectedPersonality,
+                             greeting: activeGreeting, pushToTalk: pushToTalk)
     }
 
     private func endMicHold() {
@@ -454,13 +599,14 @@ struct PetScreen: View {
     }
 
     private func installVoiceReplyHandler() {
+        director.onVoiceGesture = { beginVoice(pushToTalk: false) }
         let selectedMode = $mode
         let timerMinutes = $nightLightMinutes
         director.voice.batteryStatusReply = { [weak director] in director?.modes.batteryVoiceReply }
         director.voice.onMarchRequested = { [weak director] in director?.playMarch() }
-        director.voice.onReply = { [weak director] expression, command in
+        director.voice.onReplyExpression = { [weak director] in director?.playVoiceReply($0) }
+        director.voice.onCommand = { [weak director] command in
             guard let director else { return }
-            director.playVoiceReply(expression)
             switch command {
             case .none: break
             case .setMode(let value):
@@ -479,48 +625,242 @@ struct PetScreen: View {
                 selectedMode.wrappedValue = .nightLight
             case .countdown(let seconds):
                 director.scheduleCountdown(seconds: seconds)
+            case .play(let activity):
+                director.startPlay(activity)
+            case .face(let action):
+                director.playFaceAction(action)
             }
         }
     }
 
-    private func interactionArea(expression: PetExpression, isPreviewing: Bool, isActing: Bool) -> some View {
+    private func interactionArea(expression: PetExpression, isPreviewing: Bool, isActing: Bool,
+                                 pose: PetPose, drawingSize: CGSize, centerOffset: CGSize) -> some View {
         GeometryReader { geometry in
             Rectangle().fill(.clear)
                 .contentShape(Rectangle())
                 .accessibilityHidden(expressionShowActive)
                 .gesture(
-                    LongPressGesture(minimumDuration: 0.45)
+                    LongPressGesture(minimumDuration: 0.45, maximumDistance: 12)
                         .exclusively(before: SpatialTapGesture())
                         .onEnded { result in
                             switch result {
                             case .first:
                                 showControls = true
                             case .second(let tap):
-                                let x = 2 * tap.location.x / max(geometry.size.width, 1) - 1
-                                let y = 2 * tap.location.y / max(geometry.size.height, 1) - 1
-                                director.respondToTap(toward: CGPoint(x: min(1, max(-1, x)), y: min(1, max(-1, y))))
+                                if let eye = hitEye(at: tap.location, in: geometry.size, pose: pose,
+                                                    drawingSize: drawingSize, centerOffset: centerOffset) {
+                                    director.pokeEye(eye)
+                                    return
+                                }
+                                director.respondToTap(toward: touchPoint(tap.location, in: geometry.size))
                             }
                         }
                 )
                 .simultaneousGesture(
-                    DragGesture(minimumDistance: 24)
+                    DragGesture(minimumDistance: 16)
+                        .updating($faceDragActive) { _, active, _ in active = true }
+                        .onChanged { drag in
+                            updatePetting(drag, in: geometry.size, pose: pose, drawingSize: drawingSize, centerOffset: centerOffset)
+                        }
                         .onEnded { drag in
+                            updatePetting(drag, in: geometry.size, pose: pose, drawingSize: drawingSize, centerOffset: centerOffset)
+                            if director.isPetting {
+                                director.endPetting(completed: true)
+                                return
+                            }
                             let distance = drag.translation
                             guard -distance.height >= 52, -distance.height >= abs(distance.width) * 1.5 else { return }
-                            toggleVoice()
+                            beginVoice(pushToTalk: false)
                         },
                     including: voiceAvailable ? .all : .none
                 )
+                .onChange(of: faceDragActive) { _, active in
+                    guard !active else { return }
+                    // Let the drag's onEnded callback apply its release pose before clearing a cancelled gesture.
+                    Task { @MainActor in
+                        await Task.yield()
+                        if !faceDragActive { director.endPetting(completed: false) }
+                    }
+                }
                 .accessibilityLabel(expressionAccessibilityLabel(expression, isPreviewing: isPreviewing, isActing: isActing))
                 .accessibilityAddTraits(.isButton)
                 .accessibilityAction { director.respondToTap() }
+                .accessibilityAction(named: Text("戳左眼")) { director.pokeEye(.left) }
+                .accessibilityAction(named: Text("戳右眼")) { director.pokeEye(.right) }
+                .accessibilityAction(named: Text("轻抚眼睛")) { director.playFaceAction(.squint) }
                 .accessibilityAction(named: Text("打开表情与设置")) { showControls = true }
                 .accessibilityActions {
-                    if voiceAvailable && (!showVoiceButton || director.voice.isCapturingSpeech) {
-                        Button(canEndVoice ? "发送语音" : "开始说话", action: toggleVoice)
+                    if voiceAvailable && director.canUseVoice {
+                        Button("开始连续对话") { beginVoice(pushToTalk: false) }
                     }
                 }
         }
+    }
+
+    private func playTargets(_ session: PetDirector.PlaySession, at now: TimeInterval, in size: CGSize) -> some View {
+        let elapsed = now - session.started
+        let pointer = session.activity == .bubbles && !session.completed
+            ? director.visionPointer.map { CGPoint(x: $0.x * size.width, y: $0.y * size.height) }
+            : nil
+        let contact = pointer.flatMap { point in
+            (0..<session.targetCount).first { index in
+                let travel = elapsed - Double(index) * 0.16
+                guard session.hits[index] == nil, travel >= 0 else { return false }
+                let center = playTargetCenter(for: .bubbles, index: index, elapsed: travel, in: size)
+                return hypot(point.x - center.x, point.y - center.y) <= 28
+            }
+        }
+        return ZStack {
+            ForEach(0..<session.targetCount, id: \.self) { index in
+                let highFive = session.activity == .highFive
+                let delay = highFive ? 0 : Double(index) * 0.16
+                if elapsed >= delay {
+                    let hit = session.hits[index]
+                    let center = playTargetCenter(for: session.activity, index: index, elapsed: elapsed - delay, in: size)
+                    if hit == nil || now - (hit?.time ?? now) < 0.42 {
+                        if let hit {
+                            let progress = min(1, max(0, (now - hit.time) / 0.42))
+                            let recoil = highFive && !reduceMotion ? sin(progress * .pi) * 19 : 0
+                            ZStack {
+                                if highFive {
+                                    playPalm
+                                }
+                                ForEach(0..<6) { ray in
+                                    let angle = Double(ray) * .pi / 3
+                                    Image(systemName: highFive ? "sparkle" : "circle.fill")
+                                        .font(.system(size: highFive ? 14 : 6, weight: .semibold))
+                                        .foregroundStyle(highFive ? Color.yellow : Color.cyan)
+                                        .offset(x: cos(angle) * (20 + progress * 28),
+                                                y: sin(angle) * (20 + progress * 28))
+                                }
+                            }
+                            .opacity(1 - progress)
+                            .position(x: hit.center.x + recoil, y: hit.center.y + recoil)
+                            .allowsHitTesting(false)
+                            .accessibilityHidden(true)
+                        } else {
+                            Button {
+                                director.hitPlayTarget(index, at: center)
+                            } label: {
+                                if highFive {
+                                    playPalm
+                                } else {
+                                    Circle()
+                                        .fill(.cyan.opacity(0.17))
+                                        .overlay {
+                                            Circle().strokeBorder(
+                                                LinearGradient(colors: [.white, .cyan, .purple],
+                                                               startPoint: .topLeading, endPoint: .bottomTrailing),
+                                                lineWidth: 2
+                                            )
+                                        }
+                                        .overlay(alignment: .topLeading) {
+                                            Capsule().fill(.white.opacity(0.8))
+                                                .frame(width: 13, height: 4)
+                                                .rotationEffect(.degrees(-40))
+                                                .padding(9)
+                                        }
+                                        .frame(width: index.isMultiple(of: 2) ? 45 : 52,
+                                               height: index.isMultiple(of: 2) ? 45 : 52)
+                                        .frame(width: 54, height: 54)
+                                        .contentShape(Circle())
+                                }
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(highFive ? "拍圆圆的手掌" : "戳破第 \(index + 1) 颗泡泡")
+                            .position(center)
+                        }
+                    }
+                }
+            }
+            if let pointer {
+                Circle()
+                    .fill(.white)
+                    .frame(width: 12, height: 12)
+                    .overlay { Circle().strokeBorder(.cyan, lineWidth: 2) }
+                    .shadow(color: .cyan, radius: 6)
+                    .position(pointer)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            }
+        }
+        .frame(width: size.width, height: size.height)
+        .onChange(of: contact, initial: true) { _, index in
+            guard let index, director.playSession?.started == session.started else { return }
+            let travel = elapsed - Double(index) * 0.16
+            director.hitPlayTarget(index, at: playTargetCenter(for: .bubbles, index: index, elapsed: travel, in: size))
+        }
+        .onChange(of: director.visionHighFivePending, initial: true) { _, pending in
+            if pending && session.activity == .highFive {
+                director.consumeVisionHighFive(at: playTargetCenter(for: .highFive, index: 0, elapsed: elapsed, in: size))
+            }
+        }
+    }
+
+    private var playPalm: some View {
+        Image(systemName: "hand.raised.fill")
+            .font(.system(size: 49, weight: .semibold))
+            .foregroundStyle(Color(red: 1, green: 0.91, blue: 0.76))
+            .frame(width: 83, height: 83)
+            .background(.yellow.opacity(0.10), in: Circle())
+            .overlay { Circle().strokeBorder(.yellow.opacity(0.42), lineWidth: 1.5) }
+            .contentShape(Circle())
+    }
+
+    private func playTargetCenter(for activity: PetDirector.PlayActivity, index: Int, elapsed: TimeInterval,
+                                  in size: CGSize) -> CGPoint {
+        let time = reduceMotion ? 0.8 : elapsed
+        if activity == .highFive {
+            let rise = min(1, time / 0.28)
+            return CGPoint(x: size.width * 0.83, y: size.height * 0.52 + (1 - rise) * 50)
+        }
+        let offsets: [CGFloat] = [-0.31, -0.14, 0.16, 0.32]
+        let heights: [CGFloat] = [0.47, 0.68, 0.68, 0.45]
+        let lift = min(1, time / 0.72)
+        let drift = reduceMotion ? 0 : sin(time * 1.8 + Double(index)) * 8 * lift
+        return CGPoint(x: size.width * (0.5 + offsets[index] * (0.65 + 0.35 * lift)) + drift,
+                       y: size.height * (heights[index] + (1 - lift) * 0.12))
+    }
+
+    private func hitEye(at location: CGPoint, in size: CGSize, pose: PetPose,
+                        drawingSize: CGSize, centerOffset: CGSize) -> PetDirector.EyeSide? {
+        let scale = min(drawingSize.width / 475, drawingSize.height / 215)
+        guard scale > 0, max(pose.hearts, pose.stars, pose.glasses, pose.spirals) < 0.75 else { return nil }
+        let x = (location.x - size.width / 2 - centerOffset.width) / scale - pose.lookX
+        let y = (location.y - size.height / 2 - centerOffset.height) / scale - pose.lookY - pose.bounce
+        let angle = pose.turn * .pi / 36
+        let localX = (x * cos(angle) + y * sin(angle)) / (1 - abs(pose.turn) * 0.065)
+        let localY = -x * sin(angle) + y * cos(angle)
+        let side: PetDirector.EyeSide = localX < 0 ? .left : .right
+        let eye = side == .left ? pose.left : pose.right
+        let originX: CGFloat = side == .left ? -76 : 76
+        let dx = (localX - originX - eye.shift) / max(28, eye.width * 39)
+        let dy = (localY - eye.lift) / max(21, eye.height * 56)
+        return dx * dx + dy * dy <= 1 ? side : nil
+    }
+
+    private func updatePetting(_ drag: DragGesture.Value, in size: CGSize,
+                               pose: PetPose, drawingSize: CGSize, centerOffset: CGSize) {
+        let distance = drag.translation
+        let isHorizontal = abs(distance.width) >= 16 && abs(distance.width) > abs(distance.height) * 1.5
+        if !director.isPetting {
+            guard isHorizontal else { return }
+            // Sample across the stroke so it can begin beside the eyes and cross them.
+            let steps = max(1, Int(ceil(abs(distance.width) / 12)))
+            guard (0...steps).contains(where: { step in
+                let progress = CGFloat(step) / CGFloat(steps)
+                let point = CGPoint(x: drag.startLocation.x + distance.width * progress,
+                                    y: drag.startLocation.y + distance.height * progress)
+                return hitEye(at: point, in: size, pose: pose, drawingSize: drawingSize, centerOffset: centerOffset) != nil
+            }) else { return }
+        }
+        director.pet(toward: touchPoint(drag.location, in: size), distance: abs(distance.width))
+    }
+
+    private func touchPoint(_ location: CGPoint, in size: CGSize) -> CGPoint {
+        let x = 2 * location.x / max(size.width, 1) - 1
+        let y = 2 * location.y / max(size.height, 1) - 1
+        return CGPoint(x: min(1, max(-1, x)), y: min(1, max(-1, y)))
     }
 
     private func expressionAccessibilityLabel(_ expression: PetExpression, isPreviewing: Bool, isActing: Bool) -> String {
@@ -534,6 +874,7 @@ struct PetScreen: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 22) {
                     activitySettings
+                    playSettings
                     modeSettings
                     expressionShowSettings
                     displaySettings
@@ -633,6 +974,20 @@ struct PetScreen: View {
         .buttonStyle(.plain)
     }
 
+    private var playSettings: some View {
+        settingsSection("和圆圆玩") {
+            HStack(spacing: 24) {
+                ForEach([PetDirector.PlayActivity.bubbles, .highFive]) { activity in
+                    Button(activity.rawValue) {
+                        pendingPlayActivity = activity
+                        showControls = false
+                    }
+                    .disabled(mode == .nightLight || director.focusTimer.isFocusing || director.senses.isFaceDown)
+                }
+            }
+        }
+    }
+
     private var displaySettings: some View {
         settingsSection("屏幕与按钮") {
             HStack {
@@ -648,9 +1003,11 @@ struct PetScreen: View {
             }
             Toggle("显示设置按钮", isOn: $showSettingsButton)
             if !showSettingsButton { settingsNote("长按桌宠，打开表情与设置。") }
-            Toggle("显示语音按钮", isOn: $showVoiceButton)
-            settingsNote("在桌宠画面向上滑开始说话，再向上滑一次发送。")
+            Toggle("显示按住说话按钮", isOn: $showVoiceButton)
             Toggle("显示表情和待机提示", isOn: $showPetCaption)
+            Toggle("主动问候", isOn: $proactiveGreetings)
+            settingsNote("早上和中午，圆圆会在主画面空闲时各问候一次。")
+            settingsNote("点麦克风或向上滑开始聊天，停顿后自动发送。")
         }
     }
 
@@ -660,7 +1017,7 @@ struct PetScreen: View {
                 ForEach(PetMode.allCases) { choice in Text(choice.title).tag(choice) }
             }
             .pickerStyle(.segmented)
-            if mode == .normal { settingsNote("自动换表情，轻点播放下一个。") }
+            if mode == .normal { settingsNote("自动换表情，轻点时看向触点并播放下一个。") }
             if mode == .companion { settingsNote("安静陪伴，轻点会回应。") }
             if mode == .nightLight {
                 Picker("夜灯定时", selection: $nightLightMinutes) {
@@ -723,7 +1080,8 @@ struct PetScreen: View {
                 }
             if handGestures {
                 VStack(alignment: .leading, spacing: 6) {
-                    Label("张开手掌，左右来回挥", systemImage: "hand.wave")
+                    Label("张开手掌，左右来回挥：圆圆挥手打招呼", systemImage: "hand.wave")
+                    Label("五指张开再收拢：开始语音对话", systemImage: "hand.raised")
                     Label("双手食指尖和拇指尖相碰，围成心形", systemImage: "heart")
                     Label("收起四指，竖起大拇指", systemImage: "hand.thumbsup")
                 }
@@ -735,7 +1093,8 @@ struct PetScreen: View {
                     settingsNote("回到主画面就能试一试。")
                 }
             }
-            if eyeTracking || handGestures {
+            settingsNote("点主画面右下角的眼睛开启隔空互动。伸出食指可戳泡泡，举掌停稳后向前推可击掌。")
+            if visionEnabled || eyeTracking || handGestures {
                 switch director.senses.cameraStatus {
                 case .denied: permissionLink("相机权限未开启")
                 case .unavailable: settingsNote("当前设备无法使用前置相机。")
@@ -754,31 +1113,14 @@ struct PetScreen: View {
     }
 
     private var voiceSettings: some View {
-        settingsSection("语音聊天") {
-            SecureField(director.voice.hasAPIKey ? "输入新 Key 替换" : "DeepSeek API Key", text: $keyInput)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .privacySensitive()
-                .textFieldStyle(.roundedBorder)
-                .accessibilityLabel("DeepSeek API Key")
-            HStack {
-                Button("保存 Key") { saveKey() }
-                    .disabled(keyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                if director.voice.hasAPIKey {
-                    Spacer()
-                    Button("移除 Key", role: .destructive) { removeKey() }
-                }
-            }
-            if let keyMessage { settingsNote(keyMessage) }
-            if director.voice.hasAPIKey {
-                settingsNote("已保存至 iPhone 钥匙串。聊天会将识别出的文字及近期对话发给 DeepSeek。")
-            } else {
-                settingsNote("填写 Key 可自由聊天。你也可以直接说「跳个舞」「回窝睡觉」「开夜灯」。")
-            }
+        settingsSection("语音对话") {
+            apiKeySettings(.deepSeek, configured: director.voice.hasDeepSeekKey,
+                           detail: "生成聊天回复。自由聊天会发送转写文字和近期对话。")
             TextField("模型名称", text: $model, prompt: Text(DeepSeekClient.defaultModel))
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
                 .textFieldStyle(.roundedBorder)
+                .disabled(checkingKey == .deepSeek)
             TextField("宠物名字", text: $petName)
                 .textFieldStyle(.roundedBorder)
             Picker("性格", selection: $personality) {
@@ -789,14 +1131,55 @@ struct PetScreen: View {
                 TextField("用一句话描述它的性格", text: $customPersonality)
                     .textFieldStyle(.roundedBorder)
             }
+            Divider()
+            apiKeySettings(.doubao, configured: director.voice.hasDoubaoKey,
+                           detail: "负责实时转写和团子音色播报。未配置时使用 iPhone 本机语音。")
+            settingsNote("验证会发送一小段静音和固定试听文本。主动录音和云端播报由火山引擎处理。")
+            Link("打开豆包语音 API Key 管理",
+                 destination: URL(string: "https://console.volcengine.com/speech/new/setting/apikeys?projectName=default")!)
+                .font(.footnote)
             if director.audio.microphoneDenied { permissionLink("麦克风权限未开启") }
-            if director.voice.speechPermissionDenied { permissionLink("语音识别权限未开启") }
+            if director.voice.speechPermissionDenied && (!director.voice.hasDoubaoKey || voiceWakeEnabled) {
+                permissionLink("本机语音识别权限未开启")
+            }
+        }
+    }
+
+    private func apiKeySettings(_ account: KeychainStore.Account, configured: Bool, detail: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(account.serviceName).font(.subheadline.weight(.semibold))
+                Spacer()
+                settingsNote(configured ? "已保存" : "未配置")
+            }
+            settingsNote(detail)
+            let input = Binding(get: { keyInputs[account, default: ""] },
+                                set: { keyInputs[account] = $0 })
+            SecureField(configured ? "输入新 Key 替换" : "\(account.serviceName) API Key", text: input)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .keyboardType(.asciiCapable)
+                .privacySensitive()
+                .textFieldStyle(.roundedBorder)
+                .accessibilityLabel("\(account.serviceName) API Key")
+                .disabled(checkingKey != nil)
+            HStack {
+                Button("验证并保存") { checkKey(account, replacement: input.wrappedValue) }
+                    .disabled(input.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                if configured {
+                    Button("测试连接") { checkKey(account) }
+                    Spacer()
+                    Button("移除 Key", role: .destructive) { removeKey(account) }
+                }
+            }
+            .disabled(checkingKey != nil)
+            if let message = keyMessages[account] { settingsNote(message) }
         }
     }
 
     private var voicePlaybackSettings: some View {
         settingsSection("播报音色") {
-            settingsNote("内置普通话女声 · 离线播报")
+            settingsNote(director.voice.hasDoubaoKey ? "豆包语音 · 团子音色" : "内置普通话女声 · 离线播报")
             if let status = director.voice.voiceOutputNotice { settingsNote(status) }
             Button(director.voice.isPreviewing ? "停止试听" : "试听当前音色") {
                 if director.voice.isPreviewing {
@@ -873,23 +1256,56 @@ struct PetScreen: View {
             .fixedSize(horizontal: false, vertical: true)
     }
 
-    private func saveKey() {
-        do {
-            try director.voice.saveAPIKey(keyInput)
-            keyInput = ""
-            keyMessage = "Key 已保存。"
-        } catch {
-            keyMessage = "保存失败，请解锁 iPhone 后重试。"
+    private func checkKey(_ account: KeychainStore.Account, replacement: String? = nil) {
+        guard checkingKey == nil else { return }
+        checkingKey = account
+        keyMessages[account] = "正在验证\(account.serviceName)…"
+        let selectedModel = model
+        keyCheckTask = Task {
+            do {
+                try await director.voice.checkAPIKey(account: account, replacement: replacement, model: selectedModel)
+                guard !Task.isCancelled else { return }
+                if replacement != nil { keyInputs[account] = nil }
+                keyMessages[account] = replacement == nil ? "连接正常。" : "验证通过，Key 已保存到本机钥匙串。"
+            } catch {
+                guard !Task.isCancelled else { return }
+                keyMessages[account] = Self.keyCheckMessage(for: error)
+            }
+            checkingKey = nil
+            keyCheckTask = nil
         }
     }
 
-    private func removeKey() {
+    private static func keyCheckMessage(for error: Error) -> String {
+        switch error {
+        case PetVoice.KeyCheckError.missingKey: "请先填写 API Key。"
+        case let PetVoice.KeyCheckError.doubaoCheckFailed(feature, error):
+            switch error {
+            case DoubaoVoiceClient.VoiceError.serviceCode(let code):
+                "豆包\(feature)验证失败（\(code)）。请检查当前项目的服务权限和 Key。"
+            case let networkError as URLError where [.notConnectedToInternet, .timedOut, .cannotFindHost, .cannotConnectToHost].contains(networkError.code):
+                "豆包\(feature)连接失败，请检查网络后重试。"
+            default:
+                "豆包\(feature)验证失败，请检查 Key、服务开通状态和网络。"
+            }
+        case DeepSeekClient.RequestError.httpStatus(401): "DeepSeek 拒绝了这把 Key（401）。请检查完整密钥。"
+        case DeepSeekClient.RequestError.httpStatus(402): "DeepSeek 余额不足（402）。"
+        case DeepSeekClient.RequestError.httpStatus(429): "DeepSeek 请求过多（429），请稍后重试。"
+        case DeepSeekClient.RequestError.httpStatus(let code): "DeepSeek 返回错误（\(code)）。请检查模型名称或稍后重试。"
+        case DeepSeekClient.RequestError.invalidResponse: "DeepSeek 的回复格式有误，请重试。"
+        case is KeychainStore.KeychainError: "无法访问钥匙串，请解锁 iPhone 后重试。"
+        case is URLError: "连接失败，请检查网络后重试。"
+        default: "验证失败，请重试。"
+        }
+    }
+
+    private func removeKey(_ account: KeychainStore.Account) {
         do {
-            try director.voice.removeAPIKey()
-            keyInput = ""
-            keyMessage = "Key 已移除。"
+            try director.voice.removeAPIKey(account: account)
+            keyInputs[account] = nil
+            keyMessages[account] = account == .doubao ? "Key 已移除，已切回本机语音。" : "Key 已移除。"
         } catch {
-            keyMessage = "移除失败，请重试。"
+            keyMessages[account] = Self.keyCheckMessage(for: error)
         }
     }
 }

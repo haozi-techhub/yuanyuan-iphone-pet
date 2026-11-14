@@ -17,6 +17,8 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         case setMode(String)
         case nightLightTimer(Int)
         case countdown(Int)
+        case play(PetDirector.PlayActivity)
+        case face(PetDirector.FaceAction)
     }
 
     private enum WakeCapture {
@@ -24,44 +26,60 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     }
 
     private(set) var phase: Phase = .idle
+    private(set) var conversationActive = false
     private(set) var isCapturingSpeech = false
-    private(set) var caption: String?
+    private(set) var transcript = ""
+    private(set) var replyText: String?
+    private(set) var status: String?
     private(set) var mouthOpen = 0.0
-    private(set) var hasAPIKey: Bool
+    private(set) var hasDeepSeekKey: Bool
+    private(set) var hasDoubaoKey: Bool
     private(set) var isPreviewing = false
     private(set) var voiceOutputNotice: String?
     private(set) var speechPermissionDenied = false
+
     private(set) var isWaitingForWake = false
     private(set) var wakeNotice: String?
     private(set) var lastTranscript: String?
 
-    var canRecord: Bool { phase == .idle && !isPreviewing }
+    var canRecord: Bool { phase == .idle && !isPreviewing && !conversationActive }
 
-    @ObservationIgnored var onReply: ((PetExpression, Command) -> Void)?
-    @ObservationIgnored var batteryStatusReply: (() -> String?)?
     @ObservationIgnored var onMarchRequested: (() -> Void)?
+    @ObservationIgnored var onReplyExpression: ((PetExpression) -> Void)?
+    @ObservationIgnored var onCommand: ((Command) -> Void)?
+    @ObservationIgnored var batteryStatusReply: (() -> String?)?
+    @ObservationIgnored var canContinueConversation: (() -> Bool)?
     @ObservationIgnored private let audio: SoundSense
     @ObservationIgnored private let client = DeepSeekClient()
+    @ObservationIgnored private let doubao = DoubaoVoiceClient()
+    @ObservationIgnored private var doubaoPackets: AsyncStream<Data>.Continuation?
+    @ObservationIgnored private var doubaoRecognition: Task<Void, Never>?
     @ObservationIgnored private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "zh-CN"))
     @ObservationIgnored private let synthesizer = AVSpeechSynthesizer()
     @ObservationIgnored private var player: AVAudioPlayer?
     @ObservationIgnored private var localPlaybackText: String?
     @ObservationIgnored private var outputTask: Task<Void, Never>?
-    @ObservationIgnored private var pendingReply: (expression: PetExpression, command: Command)?
+    @ObservationIgnored private var pendingCommand: Command?
     @ObservationIgnored private var speechRequest: SFSpeechAudioBufferRecognitionRequest?
     @ObservationIgnored private var speechTask: SFSpeechRecognitionTask?
     @ObservationIgnored private var turnTask: Task<Void, Never>?
     @ObservationIgnored private var speechLimitTask: Task<Void, Never>?
     @ObservationIgnored private var mouthTask: Task<Void, Never>?
     @ObservationIgnored private var captionTask: Task<Void, Never>?
+    @ObservationIgnored private var followUpTask: Task<Void, Never>?
     @ObservationIgnored private var utteranceID: ObjectIdentifier?
     @ObservationIgnored private var turnID = UUID()
     @ObservationIgnored private var isHeld = false
     @ObservationIgnored private var pushToTalk = true
-    @ObservationIgnored private var latestText = ""
+    @ObservationIgnored private var isFollowUp = false
+    @ObservationIgnored private var greetingContext: String?
     @ObservationIgnored private var recognitionFinished = false
+    @ObservationIgnored private var noiseFloor = -60.0
+    @ObservationIgnored private var lastAudibleInput: ContinuousClock.Instant?
+    @ObservationIgnored private var lastTranscriptChange: ContinuousClock.Instant?
     @ObservationIgnored private var history: [DeepSeekClient.Message] = []
     @ObservationIgnored private var persona = Persona(model: "", name: "", personality: "")
+
     @ObservationIgnored private var wakePersona: Persona?
     @ObservationIgnored private var wakeCapture: WakeCapture?
     @ObservationIgnored private var wakeStartTask: Task<Void, Never>?
@@ -70,7 +88,8 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
 
     init(audio: SoundSense) {
         self.audio = audio
-        hasAPIKey = (try? KeychainStore.readAPIKey()) != nil
+        hasDeepSeekKey = (try? KeychainStore.readAPIKey(account: .deepSeek)) != nil
+        hasDoubaoKey = (try? KeychainStore.readAPIKey(account: .doubao)) != nil
         super.init()
         synthesizer.usesApplicationAudioSession = true
         synthesizer.delegate = self
@@ -83,21 +102,58 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         speechPermissionDenied = status == .denied || status == .restricted
     }
 
-    func saveAPIKey(_ value: String) throws {
-        let key = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        if key.isEmpty {
-            try removeAPIKey()
-        } else {
-            try KeychainStore.saveAPIKey(key)
-            hasAPIKey = true
+    enum KeyCheckError: Error {
+        case missingKey
+        case doubaoCheckFailed(feature: String, error: any Error)
+    }
+
+    func checkAPIKey(account: KeychainStore.Account, replacement: String?, model: String) async throws {
+        let rawKey = try replacement ?? KeychainStore.readAPIKey(account: account)
+        guard let key = rawKey?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty else {
+            throw KeyCheckError.missingKey
+        }
+
+        switch account {
+        case .deepSeek:
+            _ = try await client.reply(apiKey: key, model: model, messages: [
+                .init(role: "system", content: "仅输出 JSON 对象，包含非空字符串 reply。"),
+                .init(role: "user", content: "请在 reply 中回答：连接正常。")
+            ])
+        case .doubao:
+            do {
+                try await doubao.testRecognition(key: key)
+            } catch {
+                throw KeyCheckError.doubaoCheckFailed(feature: "语音识别", error: error)
+            }
+            try Task.checkCancellation()
+            do {
+                _ = try await doubao.synthesize(text: "你好，我是圆圆。", key: key)
+            } catch {
+                throw KeyCheckError.doubaoCheckFailed(feature: "语音合成", error: error)
+            }
+        }
+
+        try Task.checkCancellation()
+        guard replacement != nil else { return }
+        try KeychainStore.saveAPIKey(key, account: account)
+        switch account {
+        case .deepSeek:
+            hasDeepSeekKey = true
             history.removeAll()
+        case .doubao:
+            hasDoubaoKey = true
         }
     }
 
-    func removeAPIKey() throws {
-        try KeychainStore.removeAPIKey()
-        hasAPIKey = false
-        history.removeAll()
+    func removeAPIKey(account: KeychainStore.Account) throws {
+        try KeychainStore.removeAPIKey(account: account)
+        switch account {
+        case .deepSeek:
+            hasDeepSeekKey = false
+            history.removeAll()
+        case .doubao:
+            hasDoubaoKey = false
+        }
     }
 
     func previewVoice() {
@@ -112,22 +168,14 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         if isPreviewing { cancel() }
     }
 
-    func begin(model: String, name: String, personality: String, pushToTalk: Bool = true) {
+    func begin(model: String, name: String, personality: String, greeting: String? = nil, pushToTalk: Bool = true) {
         guard canRecord else { return }
         stopWaitingForWake()
         usePersona(Persona(model: model, name: name, personality: personality))
-        let id = UUID()
-        turnID = id
-        self.pushToTalk = pushToTalk
-        isHeld = true
-        captionTask?.cancel()
-        phase = .authorizing
-        caption = "正在准备麦克风…"
-        latestText = ""
-        recognitionFinished = false
-        turnTask = Task { [weak self] in
-            await self?.authorizeAndListen(id: id)
-        }
+        dismissConversation()
+        greetingContext = greeting
+        conversationActive = !pushToTalk
+        startTurn(pushToTalk: pushToTalk, followUp: false)
     }
 
     func configureWake(enabled: Bool, model: String, name: String, personality: String) {
@@ -160,19 +208,37 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         persona = newPersona
     }
 
+    private func startTurn(pushToTalk: Bool, followUp: Bool) {
+        let id = UUID()
+        turnID = id
+        self.pushToTalk = pushToTalk
+        isFollowUp = followUp
+        transcript = ""
+        isHeld = true
+        phase = .authorizing
+        status = followUp ? "可以接着说" : "正在准备麦克风…"
+        recognitionFinished = false
+        noiseFloor = -60
+        lastAudibleInput = nil
+        lastTranscriptChange = nil
+        turnTask = Task { [weak self] in
+            await self?.authorizeAndListen(id: id)
+        }
+    }
+
     func end() {
         isHeld = false
         guard phase == .listening else { return }
-        if wakeCapture != nil, latestText.isEmpty {
+        if wakeCapture != nil, transcript.isEmpty {
             endWakeWithoutSpeech()
             return
         }
-        phase = .thinking
-        caption = "让我想想…"
-        speechLimitTask?.cancel()
-        speechLimitTask = nil
         wakeSilenceTask?.cancel()
         wakeSilenceTask = nil
+        phase = .thinking
+        status = "让我想想…"
+        speechLimitTask?.cancel()
+        speechLimitTask = nil
         finishCapture()
 
         let id = turnID
@@ -180,32 +246,45 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
             submitTranscript(id: id)
         } else {
             speechLimitTask = Task { [weak self] in
-                do { try await Task.sleep(for: .seconds(1.2)) } catch { return }
-                self?.submitTranscript(id: id)
+                guard let self else { return }
+                let timeout: Duration = self.doubaoRecognition == nil ? .seconds(1.2) : .seconds(5)
+                do { try await Task.sleep(for: timeout) } catch { return }
+                self.submitTranscript(id: id)
             }
         }
     }
 
     func cancel() {
-        turnID = UUID()
-        isHeld = false
-        turnTask?.cancel()
-        turnTask = nil
+        conversationActive = false
         wakeStartTask?.cancel()
         wakeStartTask = nil
-        speechLimitTask?.cancel()
-        speechLimitTask = nil
         wakeSilenceTask?.cancel()
         wakeSilenceTask = nil
         isWaitingForWake = false
         wakeCapture = nil
         wakeTranscript = nil
+        followUpTask?.cancel()
+        followUpTask = nil
+        turnID = UUID()
+        isHeld = false
+        turnTask?.cancel()
+        turnTask = nil
+        speechLimitTask?.cancel()
+        speechLimitTask = nil
         clearRecognition()
         utteranceID = nil
         if synthesizer.isSpeaking { synthesizer.stopSpeaking(at: .immediate) }
+        pendingCommand = nil
         finishSpeaking()
+        dismissConversation()
+    }
+
+    func dismissConversation() {
         captionTask?.cancel()
-        caption = nil
+        transcript = ""
+        replyText = nil
+        status = nil
+        greetingContext = nil
     }
 
     private func authorizeAndListen(id: UUID) async {
@@ -213,6 +292,14 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         guard isCurrent(id) else { return }
         guard microphoneAllowed else {
             endWithStatus("请在系统设置中允许圆圆使用麦克风。")
+            return
+        }
+        if let key = try? KeychainStore.readAPIKey(account: .doubao), !key.isEmpty {
+            guard isHeld else {
+                endWithStatus("麦克风已准备好，请再说一次。")
+                return
+            }
+            startDoubaoRecognition(key: key, id: id)
             return
         }
 
@@ -224,7 +311,7 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
             return
         }
         guard isHeld else {
-            endWithStatus(pushToTalk ? "已准备好，再按住就可以说话。" : "已准备好，再上滑就可以说话。")
+            endWithStatus("麦克风已准备好，请再说一次。")
             return
         }
         guard supportsOfflineRecognition else {
@@ -232,28 +319,24 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
             return
         }
 
-        guard startRecognition(id: id) else {
+        guard startRecognition(id: id, reportLevels: !pushToTalk) else {
             endWithStatus("无法启动麦克风，请稍后再试。")
             return
         }
-        isCapturingSpeech = true
-        phase = .listening
-        caption = pushToTalk ? "松开发送" : "再次上滑发送"
-        scheduleListeningLimit(id: id)
+        startListening(id: id)
     }
 
     private var supportsOfflineRecognition: Bool {
         recognizer?.supportsOnDeviceRecognition == true && recognizer?.isAvailable == true
     }
 
-    private func startRecognition(id: UUID) -> Bool {
+    private func startRecognition(id: UUID, reportLevels: Bool = false) -> Bool {
         guard let recognizer else { return false }
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
         request.requiresOnDeviceRecognition = true
         request.taskHint = .dictation
-        request.contextualStrings = [persona.name, Self.defaultPetName, "嗨，\(persona.name)", "唱首歌", "圆圆进行曲",
-                                     "跳个舞", "打招呼", "比个心", "点个赞", "吹泡泡", "摇沙锤", "夜灯", "饱腹度"]
+        request.contextualStrings = [persona.name, Self.defaultPetName, "嗨，\(persona.name)", "唱首歌", "圆圆进行曲", "跳个舞", "打招呼", "比个心", "点个赞", "吹泡泡", "击个掌", "摇沙锤", "夜灯", "饱腹度", "看着我笑", "闭左眼", "闭右眼", "眯眯眼", "说声早安", "问我吃饭了没"]
         speechRequest = request
         speechTask = recognizer.recognitionTask(with: request, resultHandler: Self.speechHandler { [weak self] update in
             Task { @MainActor [weak self] in
@@ -262,12 +345,101 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         })
 
         do {
-            try audio.startVoiceCapture(request)
+            try audio.startVoiceCapture(request, onLevel: reportLevels ? voiceLevelHandler(id: id) : nil)
             return true
         } catch {
+            audio.stopVoiceCapture()
             clearRecognition()
             audio.finishVoice()
             return false
+        }
+    }
+
+    private func startDoubaoRecognition(key: String, id: UUID) {
+        let (stream, packets) = AsyncStream<Data>.makeStream(bufferingPolicy: .bufferingOldest(2048))
+        doubaoPackets = packets
+        do {
+            try audio.startVoiceCapture(packets: packets, onLevel: voiceLevelHandler(id: id))
+        } catch {
+            clearRecognition()
+            audio.finishVoice()
+            endWithStatus("无法启动麦克风，请稍后再试。")
+            return
+        }
+        startListening(id: id)
+        let client = doubao
+        doubaoRecognition = Task { [weak self] in
+            do {
+                try await client.recognize(key: key, audio: stream) { [weak self] update in
+                    await self?.receiveDoubao(update, id: id)
+                }
+            } catch {
+                self?.failDoubaoRecognition(error, id: id)
+            }
+        }
+    }
+
+    private func failDoubaoRecognition(_ error: Error, id: UUID) {
+        guard isCurrent(id), doubaoRecognition != nil else { return }
+        speechLimitTask?.cancel()
+        speechLimitTask = nil
+        clearRecognition()
+        audio.finishVoice()
+        if case DoubaoVoiceClient.VoiceError.serviceCode(let code) = error {
+            endWithStatus("豆包语音识别失败（\(code)），请检查服务和 Key。")
+        } else {
+            endWithStatus("豆包语音识别连接失败，请检查网络和 Key。")
+        }
+    }
+
+    private func receiveDoubao(_ update: DoubaoVoiceClient.RecognitionUpdate, id: UUID) {
+        receive(SpeechUpdate(text: update.text, alternatives: [], finished: update.isFinal), id: id)
+        guard isCurrent(id), phase == .listening, !pushToTalk,
+              update.isSentenceEnd, !transcript.isEmpty else { return }
+        end()
+    }
+
+    private func voiceLevelHandler(id: UUID) -> (@Sendable (Double) -> Void)? {
+        guard !pushToTalk else { return nil }
+        return { [weak self] level in
+            Task { @MainActor [weak self] in
+                self?.receiveVoiceLevel(level, id: id)
+            }
+        }
+    }
+
+    private func startListening(id: UUID) {
+        isCapturingSpeech = true
+        phase = .listening
+        status = pushToTalk ? "松开发送" : (isFollowUp ? "可以接着说" : "正在听，停顿后自动发送")
+
+        speechLimitTask = Task { [weak self] in
+            let started = ContinuousClock.now
+            let deadline = started + .seconds(12)
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .milliseconds(50)) } catch { return }
+                guard let self, self.isCurrent(id), self.phase == .listening else { return }
+                let now = ContinuousClock.now
+                let lastInput = [self.lastAudibleInput, self.lastTranscriptChange].compactMap { $0 }.max()
+                let shouldSend = self.doubaoRecognition == nil && !self.pushToTalk && !self.transcript.isEmpty
+                    && lastInput.map { now >= $0 + .seconds(1) } == true
+                let followUpTimedOut = self.isFollowUp && self.transcript.isEmpty && now >= started + .seconds(10)
+                if shouldSend || followUpTimedOut || now >= deadline {
+                    self.end()
+                    return
+                }
+            }
+        }
+    }
+
+    private func receiveVoiceLevel(_ level: Double, id: UUID) {
+        guard isCurrent(id), isCapturingSpeech else { return }
+        if level < noiseFloor || transcript.isEmpty {
+            let rate = level < noiseFloor ? 0.12 : 0.02
+            noiseFloor = min(-35, max(-75, noiseFloor + (level - noiseFloor) * rate))
+        }
+        if level > max(-53, noiseFloor + 10) {
+            lastAudibleInput = .now
         }
     }
 
@@ -392,11 +564,12 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     private func acceptWake(_ phrase: String, id: UUID) {
         wakeCapture = .addressed
         wakeTranscript = nil
-        latestText = ""
+        transcript = ""
         recognitionFinished = false
         isWaitingForWake = false
         isCapturingSpeech = true
         captionTask?.cancel()
+        replyText = nil
         phase = .listening
         scheduleListeningLimit(id: id)
         updateWakeTranscript(phrase, id: id)
@@ -405,8 +578,8 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     private func updateWakeTranscript(_ phrase: String, id: UUID) {
         guard wakeTranscript != phrase else { return }
         wakeTranscript = phrase
-        latestText = phrase
-        caption = phrase.isEmpty ? "我在听…" : phrase
+        transcript = phrase
+        status = phrase.isEmpty ? "我在听…" : nil
         wakeSilenceTask?.cancel()
         wakeSilenceTask = nil
         guard !phrase.isEmpty else { return }
@@ -418,7 +591,7 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     }
 
     private func completeWakePhrase(id: UUID) {
-        if !latestText.isEmpty {
+        if !transcript.isEmpty {
             recognitionFinished = true
             end()
         } else if wakeCapture == .addressed {
@@ -443,13 +616,14 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         wakeTranscript = nil
         clearRecognition()
         finishSpeaking()
-        caption = nil
+        dismissConversation()
     }
 
     private func endWithStatus(_ status: String) {
+        conversationActive = false
         isHeld = false
         phase = .idle
-        caption = status
+        self.status = status
         expireCaption()
         scheduleWake()
     }
@@ -483,27 +657,29 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     }
 
     private func receive(_ update: SpeechUpdate, id: UUID) {
-        guard isCurrent(id), speechTask != nil else { return }
+        guard isCurrent(id), speechTask != nil || doubaoRecognition != nil else { return }
         if let wakeCapture, phase != .thinking {
             receiveWake(update, id: id, capture: wakeCapture)
             return
         }
-        if let text = update.text, !text.isEmpty {
-            if wakeCapture == .addressed {
-                latestText = Self.addressedPhrase(text, name: persona.name) ?? ""
-            } else {
-                latestText = text
+        if let text = update.text, !text.isEmpty, text != transcript {
+            if isFollowUp && transcript.isEmpty {
+                replyText = nil
+                status = "正在听，停顿后自动发送"
             }
-            if wakeCapture != .addressed, update.finished {
-                latestText = Self.correctMarchTitle(in: latestText, using: update.alternatives, name: persona.name)
-            }
-            if phase == .listening { caption = latestText }
+            transcript = text
+            lastTranscriptChange = .now
         }
         if update.finished {
+            if wakeCapture == .addressed {
+                transcript = Self.addressedPhrase(transcript, name: persona.name) ?? ""
+            } else {
+                transcript = Self.correctMarchTitle(in: transcript, using: update.alternatives, name: persona.name)
+            }
             recognitionFinished = true
             if phase == .listening {
                 finishCapture()
-                if latestText.isEmpty { caption = pushToTalk ? "松开就可以发送。" : "再次上滑发送。" }
+                if transcript.isEmpty || !pushToTalk { end() }
             } else if phase == .thinking {
                 submitTranscript(id: id)
             }
@@ -512,27 +688,40 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
 
     private func finishCapture() {
         isCapturingSpeech = false
-        guard let request = speechRequest else { return }
+        guard speechRequest != nil || doubaoPackets != nil else { return }
         audio.stopVoiceCapture()
-        request.endAudio()
+        speechRequest?.endAudio()
         speechRequest = nil
+        doubaoPackets?.finish()
+        doubaoPackets = nil
     }
 
     private func clearRecognition() {
         finishCapture()
         speechTask?.cancel()
         speechTask = nil
+        doubaoRecognition?.cancel()
+        doubaoRecognition = nil
     }
 
     private func submitTranscript(id: UUID) {
-        guard turnID == id, phase == .thinking, speechTask != nil else { return }
+        guard isCurrent(id), phase == .thinking, speechTask != nil || doubaoRecognition != nil else { return }
         speechLimitTask?.cancel()
         speechLimitTask = nil
         clearRecognition()
-        let text = latestText.trimmingCharacters(in: .whitespacesAndNewlines)
         wakeCapture = nil
         wakeTranscript = nil
+        let text = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else {
+            if isFollowUp {
+                conversationActive = false
+                audio.finishVoice()
+                phase = .idle
+                status = nil
+                expireCaption()
+                scheduleWake()
+                return
+            }
             speak("我没听清，再说一次吧。", expression: .confused)
             return
         }
@@ -542,39 +731,53 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         }
     }
 
-    private func respond(to text: String, id: UUID) async {
+    private func respond(to spoken: String, id: UUID) async {
         guard isCurrent(id) else { return }
-        let phrase = Self.addressedPhrase(text, name: persona.name) ?? text
-        if phrase.isEmpty {
+        let text = Self.addressedPhrase(spoken, name: persona.name) ?? spoken
+        if text.isEmpty {
             speak("我在呢。", expression: .greeting)
             return
         }
-        if Self.isMarchRequest(phrase) {
-            caption = nil
+        if Self.isMarchRequest(text) {
+            dismissConversation()
             finishSpeaking()
             onMarchRequested?()
             return
         }
-        if Self.isBatteryQuestion(phrase) {
-            speak(batteryStatusReply?() ?? "切到电量宠物模式，我就能告诉你。", expression: .idle)
+        if conversationActive, Self.endsConversation(text) {
+            conversationActive = false
+            speak("好，等你想聊再叫我。", expression: .happy)
             return
         }
-        if let localReply = Self.localReply(to: phrase) {
+        let contextualText = greetingContext.map { "圆圆刚才问候：\($0)\n我的回答：\(text)" } ?? text
+        greetingContext = nil
+        if Self.isBatteryQuestion(text) {
+            let reply = batteryStatusReply?() ?? "切到电量宠物模式，我就能告诉你。"
+            rememberTurn(user: contextualText, reply: reply)
+            speak(reply, expression: .idle)
+            return
+        }
+        if let localReply = Self.localReply(to: text) {
+            rememberTurn(user: contextualText, reply: localReply.text)
+            if case .play = localReply.command { conversationActive = false }
             speak(localReply.text, expression: localReply.expression, command: localReply.command)
             return
         }
-
-        guard let key = try? KeychainStore.readAPIKey(), !key.isEmpty else {
-            speak("可以叫我唱歌、跳舞，或者比个心。", expression: .curious)
+        guard let key = try? KeychainStore.readAPIKey(account: .deepSeek), !key.isEmpty else {
+            if let reply = Self.offlineChatReply(to: text) {
+                speak(reply, expression: .happy)
+                return
+            }
+            speak("可以叫我跳舞、比个心。自由聊天可以在设置里填写 DeepSeek Key。", expression: .curious)
             return
         }
 
-        let user = DeepSeekClient.Message(role: "user", content: phrase)
+        let user = DeepSeekClient.Message(role: "user", content: contextualText)
         let messages = [DeepSeekClient.Message(role: "system", content: persona.prompt)] + history + [user]
         do {
             let response = try await client.reply(apiKey: key, model: persona.model, messages: messages)
             guard isCurrent(id) else { return }
-            let command = Self.validate(response.command, spoken: phrase)
+            let command = Self.validate(response.command, spoken: text)
             if let type = response.command?.type, type != "none", command == .none {
                 speak("我没确认你想让我做什么，再说一次吧。", expression: .confused)
                 return
@@ -582,11 +785,11 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
             let reply = String(response.reply.trimmingCharacters(in: .whitespacesAndNewlines).prefix(40))
             let emotion = response.emotion.flatMap { Emotion(rawValue: $0.trimmingCharacters(in: .whitespacesAndNewlines)) }
             let expression = command == .none ? (emotion ?? .neutral).expression : .happy
-            history.append(contentsOf: [user, .init(role: "assistant", content: reply)])
-            history = Array(history.suffix(16))
+            rememberTurn(user: contextualText, reply: reply)
             speak(reply, expression: expression, command: command)
         } catch {
             guard isCurrent(id) else { return }
+            conversationActive = false
             switch error {
             case DeepSeekClient.RequestError.httpStatus(401):
                 speak("DeepSeek 密钥无效，请检查语音设置。", expression: .confused)
@@ -595,7 +798,8 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
             case DeepSeekClient.RequestError.httpStatus(429):
                 speak("DeepSeek 现在有点忙，等会儿再聊吧。", expression: .confused)
             case DeepSeekClient.RequestError.invalidResponse:
-                speak("我没听清，再说一次吧。", expression: .confused)
+                audio.finishVoice()
+                endWithStatus("已识别到你的话，但聊天服务暂时没能生成回复。")
             case is URLError:
                 speak("暂时连不上网络，我还能跳舞和开夜灯。", expression: .confused)
             default:
@@ -604,21 +808,63 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         }
     }
 
-    private func speak(_ text: String, expression: PetExpression, command: Command = .none) {
-        caption = text
-        phase = .speaking
-        pendingReply = (expression, command)
-        playVoice(text)
+    private func rememberTurn(user: String, reply: String) {
+        history.append(contentsOf: [.init(role: "user", content: user), DeepSeekClient.Reply(reply: reply).historyMessage])
+        history = Array(history.suffix(16))
     }
 
-    private func playVoice(_ text: String) {
+    private static func endsConversation(_ text: String) -> Bool {
+        let phrase = singleUtterance(text)
+        return ["结束对话", "结束聊天", "不用听了", "先聊到这儿", "先聊到这里"].contains(phrase)
+    }
+
+    func announceGreeting(_ text: String) {
+        guard canRecord else { return }
+        stopWaitingForWake()
+        captionTask?.cancel()
+        turnID = UUID()
+        transcript = ""
+        speak(text, expression: .greeting, allowCloud: false)
+    }
+
+    private func speak(_ text: String, expression: PetExpression, command: Command = .none, allowCloud: Bool = true) {
+        status = nil
+        replyText = text
+        phase = .speaking
+        pendingCommand = command
+        switch command {
+        case .face: break // The face action starts when the reply audio is ready.
+        default: onReplyExpression?(expression)
+        }
+        playVoice(text, allowCloud: allowCloud)
+    }
+
+    private func playVoice(_ text: String, allowCloud: Bool = true) {
         voiceOutputNotice = nil
         let id = turnID
+        let cloudKey = allowCloud ? try? KeychainStore.readAPIKey(account: .doubao) : nil
+        let client = doubao
         outputTask = Task { [weak self] in
-            let data = try? await LocalTTSClient.synthesize(text: text)
+            let cloudAudio: Data?
+            if let cloudKey {
+                cloudAudio = try? await client.synthesize(text: text, key: cloudKey)
+            } else {
+                cloudAudio = nil
+            }
+            guard !Task.isCancelled else { return }
+            let data: Data?
+            if let cloudAudio {
+                data = cloudAudio
+            } else {
+                data = try? await LocalTTSClient.synthesize(text: text)
+            }
             guard let self, self.isCurrent(id) else { return }
             self.outputTask = nil
-            if data == nil { self.noteVoicePackFallback() }
+            if data == nil {
+                self.noteVoicePackFallback()
+            } else if cloudKey != nil, cloudAudio == nil {
+                self.voiceOutputNotice = "豆包语音播报暂不可用，已使用离线音色。"
+            }
             self.startPlayback(text, audioData: data)
         }
     }
@@ -627,7 +873,8 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         do {
             try audio.prepareVoicePlayback()
         } catch {
-            voiceOutputNotice = "暂时无法播放语音。"
+            voiceOutputNotice = "无法启动语音播放，请检查音频输出。"
+            if !isPreviewing { status = voiceOutputNotice }
             presentReply()
             finishSpeaking()
             return
@@ -653,10 +900,20 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         presentReply()
     }
 
+    func replayReply() {
+        guard canRecord, let replyText else { return }
+        captionTask?.cancel()
+        turnID = UUID()
+        phase = .speaking
+        status = nil
+        playVoice(replyText)
+    }
+
     private func presentReply() {
-        guard let reply = pendingReply else { return }
-        pendingReply = nil
-        onReply?(reply.expression, reply.command)
+        guard let command = pendingCommand else { return }
+        if case .play = command { return }
+        pendingCommand = nil
+        onCommand?(command)
     }
 
     private func noteVoicePackFallback() {
@@ -667,7 +924,15 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         guard let player = try? AVAudioPlayer(data: data) else { return false }
         player.delegate = self
         player.isMeteringEnabled = true
+        player.volume = 1
+        player.prepareToPlay()
         guard player.play() else { return false }
+        let session = AVAudioSession.sharedInstance()
+        if session.outputVolume == 0 {
+            status = "媒体音量为零，请按音量加键。"
+        } else if let output = session.currentRoute.outputs.first, output.portType != .builtInSpeaker {
+            status = "声音正从\(output.portName)播放。"
+        }
         self.player = player
         let id = turnID
         mouthTask = Task { [weak self] in
@@ -704,10 +969,11 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         return voice ?? AVSpeechSynthesisVoice(language: language)
     }
 
-    private func finishSpeaking() {
+    private func finishSpeaking(resumeConversation: Bool = false) {
         outputTask?.cancel()
         outputTask = nil
-        pendingReply = nil
+        let command = pendingCommand
+        pendingCommand = nil
         utteranceID = nil
         stopLocalPlayback()
         speechLimitTask?.cancel()
@@ -717,7 +983,28 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         mouthOpen = 0
         audio.finishVoice()
         isPreviewing = false
+        if resumeConversation && conversationActive {
+            let id = turnID
+            phase = .authorizing
+            followUpTask = Task { [weak self] in
+                do { try await Task.sleep(for: .milliseconds(350)) } catch { return }
+                guard let self, self.isCurrent(id), self.conversationActive else { return }
+                self.followUpTask = nil
+                guard self.canContinueConversation?() == true else {
+                    self.conversationActive = false
+                    self.phase = .idle
+                    self.status = nil
+                    self.expireCaption()
+                    self.scheduleWake()
+                    return
+                }
+                self.startTurn(pushToTalk: false, followUp: true)
+            }
+            return
+        }
+        conversationActive = false
         phase = .idle
+        if let command, case .play = command { onCommand?(command) }
         expireCaption()
         scheduleWake()
     }
@@ -732,9 +1019,9 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     private func expireCaption() {
         captionTask?.cancel()
         captionTask = Task { [weak self] in
-            do { try await Task.sleep(for: .seconds(6)) } catch { return }
+            do { try await Task.sleep(for: .seconds(12)) } catch { return }
             guard let self, self.phase == .idle else { return }
-            self.caption = nil
+            self.dismissConversation()
         }
     }
 
@@ -760,11 +1047,11 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     }
 
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
-        notifySpeechFinished(ObjectIdentifier(utterance))
+        notifySpeechFinished(ObjectIdentifier(utterance), completed: true)
     }
 
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
-        notifySpeechFinished(ObjectIdentifier(utterance))
+        notifySpeechFinished(ObjectIdentifier(utterance), completed: false)
     }
 
     nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
@@ -787,14 +1074,14 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
                 self.startPlayback(text)
                 return
             }
-            self.finishSpeaking()
+            self.finishSpeaking(resumeConversation: successfully)
         }
     }
 
-    private nonisolated func notifySpeechFinished(_ id: ObjectIdentifier) {
+    private nonisolated func notifySpeechFinished(_ id: ObjectIdentifier, completed: Bool) {
         Task { @MainActor [weak self] in
             guard let self, self.utteranceID == id else { return }
-            self.finishSpeaking()
+            self.finishSpeaking(resumeConversation: completed)
         }
     }
 
@@ -909,15 +1196,48 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         return text.wholeMatch(of: #/(?:请问)?(?:你(?:的)?|手机(?:的)?|桌宠(?:的)?|现在|目前)*(?:充满(?:电)?了?吗|电充满了?吗|充满电(?:了)?没有|电量(?:还剩|剩下|是)?多少|还有多少电|还剩多少电|饱腹度多少|(?:正在|在)充电吗)/#) != nil
     }
 
+    private static func offlineChatReply(to text: String) -> String? {
+        switch normalizedCommand(text) {
+        case "你好", "你好呀", "嗨", "哈喽", "hi", "hello": "你好呀！我在这儿陪你。"
+        case "早上好", "早安", "早", "早呀": "早上好！今天慢慢来，先做一件想做的事。"
+        case "中午好", "午安": "中午好！忙了一上午，记得吃饭。"
+        case "吃了", "吃过了", "吃了午饭", "吃过午饭了": "那就好！忙完可以歇一小会儿。"
+        case "还没", "没吃", "还没吃", "没吃午饭": "那记得给自己留点吃饭的时间呀。"
+        case "下午好": "下午好！陪你伸个懒腰。"
+        case "晚上好": "晚上好！今天辛苦啦。"
+        case "晚安", "睡了", "去睡了": "晚安，明天见。"
+        case "谢谢", "谢谢你", "多谢": "不客气，我就在这儿。"
+        case "累了", "好累", "今天好累", "今天很累": "辛苦啦，先歇一会儿吧。"
+        default: nil
+        }
+    }
+
     private static func localReply(to spoken: String) -> LocalReply? {
+        if singleUtterance(spoken).wholeMatch(of: #/(?:请)?问我吃(?:午)?饭了(?:没|吗)/#) != nil {
+            return LocalReply(text: PetGreetingPeriod.lunch.greeting, expression: .greeting)
+        }
         guard let action = requestedAction(from: spoken) else { return nil }
         if action.wholeMatch(of: #/跳(?:一?[个支段曲])?舞(?:给我看)?/#) != nil {
             return LocalReply(text: "看我的，开跳！", expression: .dancing)
         }
         if action.wholeMatch(of: #/吹(?:(?:一|几)?[个串])?泡泡/#) != nil {
-            return LocalReply(text: "看，泡泡飞起来啦！", expression: .bubbles)
+            return LocalReply(text: "泡泡飞起来啦，戳破它们！", expression: .bubbles, command: .play(.bubbles))
         }
         switch action {
+        case "看我", "看着我", "看着我笑", "看我笑", "冲我笑", "对我笑":
+            return LocalReply(text: "我看到你啦！", expression: .happy, command: .face(.lookAndSmile))
+        case "闭左眼", "闭上左眼", "眨左眼", "戳左眼":
+            return LocalReply(text: "左眼闭上啦。", expression: .idle, command: .face(.closeEye(.left)))
+        case "闭右眼", "闭上右眼", "眨右眼", "戳右眼":
+            return LocalReply(text: "右眼闭上啦。", expression: .idle, command: .face(.closeEye(.right)))
+        case "眯眼", "眯眯眼", "眯起眼睛":
+            return LocalReply(text: "眯起来啦。", expression: .happy, command: .face(.squint))
+        case "说早安", "说声早安", "说一声早安":
+            return LocalReply(text: PetGreetingPeriod.morning.greeting, expression: .greeting)
+        case "问我吃饭了", "问我吃午饭了":
+            return LocalReply(text: PetGreetingPeriod.lunch.greeting, expression: .greeting)
+        case "击掌", "击个掌", "击一个掌", "跟我击掌", "和我击掌", "来击掌", "来击个掌":
+            return LocalReply(text: "来，拍我的手！", expression: .happy, command: .play(.highFive))
         case "回窝睡觉", "去睡觉", "睡觉", "睡一会儿":
             return LocalReply(text: "晚安，我先眯一会儿。", expression: .sleepy)
         case "打招呼", "打个招呼", "打声招呼", "挥手", "挥挥手":

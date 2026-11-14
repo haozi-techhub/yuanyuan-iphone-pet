@@ -7,6 +7,9 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		000000000000000000000062 /* PetChat.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000052 /* PetChat.swift */; };
+		000000000000000000000061 /* PetVisionPlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000051 /* PetVisionPlay.swift */; };
+		000000000000000000000060 /* DoubaoVoiceClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000050 /* DoubaoVoiceClient.swift */; };
 		000000000000000000000021 /* DesktopPetApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000011 /* DesktopPetApp.swift */; };
 		000000000000000000000022 /* PetExpression.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000012 /* PetExpression.swift */; };
 		000000000000000000000023 /* PetFace.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000013 /* PetFace.swift */; };
@@ -30,6 +33,9 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		000000000000000000000052 /* PetChat.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PetChat.swift; sourceTree = "<group>"; };
+		000000000000000000000051 /* PetVisionPlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PetVisionPlay.swift; sourceTree = "<group>"; };
+		000000000000000000000050 /* DoubaoVoiceClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DoubaoVoiceClient.swift; sourceTree = "<group>"; };
 		000000000000000000000011 /* DesktopPetApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesktopPetApp.swift; sourceTree = "<group>"; };
 		000000000000000000000012 /* PetExpression.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PetExpression.swift; sourceTree = "<group>"; };
 		000000000000000000000013 /* PetFace.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PetFace.swift; sourceTree = "<group>"; };
@@ -84,6 +90,9 @@
 				000000000000000000000049 /* PetFocusTimer.swift */,
 				00000000000000000000004A /* PetCatchGame.swift */,
 				000000000000000000000018 /* PetSenses.swift */,
+				000000000000000000000052 /* PetChat.swift */,
+				000000000000000000000051 /* PetVisionPlay.swift */,
+				000000000000000000000050 /* DoubaoVoiceClient.swift */,
 				000000000000000000000019 /* MotionSense.swift */,
 				00000000000000000000001A /* SoundSense.swift */,
 				00000000000000000000001B /* PetModes.swift */,
@@ -187,6 +196,9 @@
 				00000000000000000000004B /* PetFocusTimer.swift in Sources */,
 				00000000000000000000004C /* PetCatchGame.swift in Sources */,
 				000000000000000000000026 /* PetSenses.swift in Sources */,
+				000000000000000000000062 /* PetChat.swift in Sources */,
+				000000000000000000000061 /* PetVisionPlay.swift in Sources */,
+				000000000000000000000060 /* DoubaoVoiceClient.swift in Sources */,
 				000000000000000000000027 /* MotionSense.swift in Sources */,
 				000000000000000000000028 /* SoundSense.swift in Sources */,
 				000000000000000000000029 /* PetModes.swift in Sources */,

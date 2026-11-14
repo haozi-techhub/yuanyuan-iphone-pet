@@ -5,11 +5,46 @@ import UserNotifications
 @MainActor
 @Observable
 final class PetDirector {
+    enum PlayActivity: String, Identifiable {
+        case bubbles = "戳泡泡"
+        case highFive = "击掌"
+
+        var id: Self { self }
+    }
+
+    struct PlaySession {
+        struct Hit {
+            let time: TimeInterval
+            let center: CGPoint
+        }
+
+        let activity: PlayActivity
+        let started: TimeInterval
+        let fromVision: Bool
+        var hits: [Int: Hit] = [:]
+
+        var targetCount: Int { activity == .bubbles ? 4 : 1 }
+        var completed: Bool { hits.count == targetCount }
+    }
+
+    enum EyeSide: Equatable { case left, right }
+    enum FaceAction: Equatable {
+        case lookAndSmile, closeEye(EyeSide), squint
+    }
+
+    private(set) var playSession: PlaySession?
+    private(set) var visionPointer: CGPoint?
+    private(set) var visionHighFivePending = false
+    private var lastPointerAt: TimeInterval?
+    private var visionHintShown = false
+    private(set) var visionHint: String?
+    private var visionHintUntil: TimeInterval = 0
     let senses = PetSenses()
     let modes = PetModes()
     let focusTimer = PetFocusTimer()
     let audio: SoundSense
     let voice: PetVoice
+    @ObservationIgnored var onVoiceGesture: (() -> Void)?
 
     struct Settings: Equatable {
         var mode: PetMode
@@ -17,6 +52,7 @@ final class PetDirector {
         var keepAwake: Bool
         var eyeTracking: Bool
         var handGestures: Bool
+        var visionEnabled: Bool
         var motion: Bool
         var sound: Bool
         var foreground: Bool
@@ -55,6 +91,8 @@ final class PetDirector {
     private(set) var notice: String?
     @ObservationIgnored private var noticeUntil: TimeInterval = 0
     @ObservationIgnored private var tapAttention: (point: CGPoint, until: TimeInterval)?
+    @ObservationIgnored private var strokeAttention: (point: CGPoint, strength: CGFloat)?
+    @ObservationIgnored private var eyePoke: (side: EyeSide, started: TimeInterval)?
     @ObservationIgnored private var position = CGPoint.zero
     @ObservationIgnored private var positionVelocity = CGPoint.zero
     @ObservationIgnored private var lastMotionFrame: TimeInterval?
@@ -72,6 +110,8 @@ final class PetDirector {
         voice = PetVoice(audio: audio)
         petAudio = PetAudioPlayer(audio: audio)
 
+        voice.canContinueConversation = { [weak self] in self?.voiceAvailable == true }
+        senses.onVisionPlay = { [weak self] in self?.handleVision($0) }
         senses.onEvent = { [weak self] in self?.handle($0) }
         audio.onEvent = { [weak self] event in
             switch event {
@@ -97,23 +137,57 @@ final class PetDirector {
 
     var now: TimeInterval { ProcessInfo.processInfo.systemUptime - started }
 
-    var canUseVoice: Bool {
+    var canUseVoice: Bool { voiceAvailable && voice.canRecord }
+
+    private var voiceAvailable: Bool {
         guard let settings else { return false }
         return expressionShow == nil && settings.foreground && !settings.controlsOpen && settings.mode != .nightLight
-            && !senses.isFaceDown && voice.canRecord
+            && !senses.isFaceDown
     }
 
     private var reactionsAllowed: Bool {
+        reactionContextAllowed && playSession == nil
+    }
+
+    private var reactionContextAllowed: Bool {
         guard let settings else { return false }
         return expressionShow == nil && !isPlayingMarch && settings.foreground && !settings.controlsOpen && settings.mode != .nightLight
             && !settings.focusing && !senses.isFaceDown && voice.phase == .idle
+            && !isPetting && !(eyePoke.map { now < $0.started + 0.55 } ?? false)
+    }
+
+    private var isCompanionMode: Bool { settings?.mode == .normal || settings?.mode == .companion }
+
+    private var touchAllowed: Bool {
+        guard let settings else { return false }
+        return expressionShow == nil && settings.foreground && !settings.controlsOpen && !settings.focusing && !isPlayingMarch
+            && settings.mode != .nightLight && !senses.isFaceDown && !modes.isCharging
+            && !playback.isPreviewing(at: now)
+    }
+
+    var canPet: Bool {
+        isCompanionMode && touchAllowed && playSession == nil
+    }
+
+    var isPetting: Bool { strokeAttention != nil }
+
+    var canOfferGreeting: Bool {
+        isCompanionMode && touchAllowed && reactionsAllowed && voice.canRecord && !playback.hasActiveSelection(at: now)
     }
 
     func configure(_ settings: Settings) {
         let modeChanged = self.settings?.mode != settings.mode
         let controlsChanged = self.settings?.controlsOpen != settings.controlsOpen
+        let enablingVision = settings.visionEnabled && self.settings?.visionEnabled != true
         let startingFocus = settings.focusing && self.settings?.focusing != true
         self.settings = settings
+        if !settings.visionEnabled || !settings.foreground || settings.controlsOpen || startingFocus || modeChanged {
+            clearVisionPlay()
+        }
+        if modeChanged || !settings.foreground || settings.controlsOpen || startingFocus {
+            clearTouch()
+            endPlay()
+        }
         let time = now
         finishRotation(at: time)
         if modeChanged || !settings.foreground || settings.controlsOpen || startingFocus {
@@ -149,16 +223,17 @@ final class PetDirector {
             audio.setEnabled(false)
             voice.cancel()
         }
-        let sensing = settings.foreground && !settings.controlsOpen && !settings.focusing
         updateOrientation()
-        senses.configure(active: sensing, eyeTracking: settings.eyeTracking,
-                         handGestures: settings.handGestures, motionEnabled: settings.motion && !settings.focusing,
-                         suppressCamera: modes.sensorsSuppressed || settings.focusing)
+        configureSenses()
+        if enablingVision { visionCameraStatusChanged() }
         updateAmbientAudio()
         refreshBaseline(interrupt: startingFocus)
     }
 
     func stop() {
+        clearTouch()
+        playSession = nil
+        clearVisionPlay()
         finishRotation(at: now)
         stopMarch()
         stopExpressionAudio()
@@ -180,8 +255,16 @@ final class PetDirector {
 
     func tick() {
         focusTimer.refresh()
-        if settings.map({ $0.eyeTracking || $0.handGestures || $0.motion }) == true { updateOrientation() }
         let time = now
+        if let playSession {
+            let lastHitAt = playSession.hits.values.map(\.time).max() ?? playSession.started
+            if (playSession.completed && time >= lastHitAt + 0.45)
+                || (playSession.fromVision && time >= playSession.started + 14) {
+                endPlay()
+            }
+        }
+
+        if settings.map({ $0.visionEnabled || $0.eyeTracking || $0.handGestures || $0.motion }) == true { updateOrientation() }
         finishRotation(at: time)
         modes.tick()
         refreshBaseline()
@@ -210,9 +293,12 @@ final class PetDirector {
         updateRotation(at: time)
         updateExpressionAudio(at: time)
         if notice != nil, time >= noticeUntil { notice = nil }
+        if visionHint != nil, time >= visionHintUntil { visionHint = nil }
     }
 
     func show(_ expression: PetExpression) {
+        endPlay()
+        clearTouch()
         finishRotation(at: now)
         stopExpressionSoundSample()
         stopMarch()
@@ -228,7 +314,8 @@ final class PetDirector {
 
     func respondToTap(toward point: CGPoint = .zero) {
         guard expressionShow == nil, !isPlayingMarch else { return }
-        guard settings?.focusing != true else { return }
+        guard settings?.focusing != true, playSession == nil, !isPetting else { return }
+        eyePoke = nil
         completedExpressionShow = nil
         followUp = nil
         nextAmbientAt = nil
@@ -254,6 +341,190 @@ final class PetDirector {
             playback.respondToTap(at: time, toward: gaze)
         }
         updateExpressionAudio(at: time)
+    }
+
+    func pokeEye(_ side: EyeSide) {
+        guard touchAllowed, strokeAttention == nil, playSession == nil else { return }
+        completedExpressionShow = nil
+        followUp = nil
+        nextAmbientAt = nil
+        clearTouch()
+        finishRotation(at: now)
+        refreshBaseline(interrupt: true)
+        eyePoke = (side, now)
+    }
+
+    func playFaceAction(_ action: FaceAction) {
+        guard touchAllowed, playSession == nil else { return }
+        switch action {
+        case .lookAndSmile:
+            playback.playTapSmile(at: now, toward: .zero)
+        case .closeEye(let side):
+            pokeEye(side)
+        case .squint:
+            playback.playPettingSmile(at: now, startingAt: .pettingSmile)
+        }
+    }
+
+    func startPlay(_ activity: PlayActivity, fromVision: Bool = false) {
+        guard voiceAvailable, settings?.focusing != true, !isPlayingMarch else { return }
+        if !fromVision { voice.cancel() }
+        visionHighFivePending = false
+        clearTouch()
+        completedExpressionShow = nil
+        followUp = nil
+        nextAmbientAt = nil
+        nextRotationAt = nil
+        rotationTapQueued = false
+        let time = now
+        finishRotation(at: time)
+        if activity == .bubbles {
+            playback.react(.bubbles, at: time, priority: .immediate)
+        } else {
+            refreshBaseline(interrupt: true)
+        }
+        playSession = PlaySession(activity: activity, started: time, fromVision: fromVision)
+    }
+
+    func visionCameraStatusChanged() {
+        guard settings?.visionEnabled == true else { return }
+        switch senses.cameraStatus {
+        case .active:
+            if !visionHintShown {
+                visionHintShown = true
+                showVisionHint("挥挥手，我看得见你")
+            }
+        case .denied:
+            clearVisionPlay()
+            showVisionHint("到系统设置里允许圆圆使用相机")
+        case .unavailable:
+            clearVisionPlay()
+            showVisionHint("当前设备无法使用前置相机")
+        case .thermal:
+            clearVisionPlay()
+            showVisionHint("手机有点热，视觉先歇一会儿")
+        case .inactive, .starting:
+            clearVisionPlay()
+        }
+    }
+
+    private func configureSenses() {
+        guard let settings else { return }
+        let cameraAllowed = expressionShow == nil && !isPlayingMarch && !settings.focusing
+        senses.configure(active: settings.foreground && !settings.controlsOpen && !settings.focusing,
+                         eyeTracking: cameraAllowed && (settings.visionEnabled || settings.eyeTracking),
+                         handGestures: cameraAllowed && (settings.visionEnabled || settings.handGestures),
+                         motionEnabled: settings.motion && !settings.focusing,
+                         suppressCamera: modes.sensorsSuppressed,
+                         visionPlayEnabled: cameraAllowed && settings.visionEnabled)
+    }
+
+    private func clearVisionPlay() {
+        if playSession?.fromVision == true { playSession = nil }
+        visionPointer = nil
+        visionHighFivePending = false
+        lastPointerAt = nil
+        visionHint = nil
+        visionHintShown = false
+    }
+
+    private func showVisionHint(_ text: String) {
+        visionHint = text
+        visionHintUntil = now + 4
+    }
+
+    private func handleVision(_ frame: VisionPlayFrame) {
+        guard !isPlayingMarch, settings?.visionEnabled == true, voiceAvailable, settings?.focusing != true,
+              voice.phase == .idle, !isPetting, !playback.isPreviewing(at: now) else { return }
+        let time = now
+        if let tip = frame.pointer {
+            // The camera buffers are upright and unmirrored. Use selfie coordinates on screen.
+            let target = CGPoint(x: 1 - tip.x, y: 1 - tip.y)
+            if let current = visionPointer {
+                visionPointer = CGPoint(x: current.x + (target.x - current.x) * 0.65,
+                                        y: current.y + (target.y - current.y) * 0.65)
+            } else {
+                visionPointer = target
+            }
+            lastPointerAt = time
+        } else if let lastPointerAt, time - lastPointerAt > 0.18 {
+            visionPointer = nil
+        }
+        switch frame.trigger {
+        case .pointReady:
+            if playSession == nil || playSession?.activity == .highFive && playSession?.fromVision == true {
+                startPlay(.bubbles, fromVision: true)
+                visionHint = nil
+            }
+        case .palmReady:
+            if playSession == nil {
+                startPlay(.highFive, fromVision: true)
+                showVisionHint("手掌往前推一下")
+            }
+        case .palmPushed:
+            if let session = playSession, session.activity == .highFive, !session.completed {
+                // The view resolves the hit against the same geometry that draws the palm.
+                visionHighFivePending = true
+                visionHint = nil
+            }
+        case nil:
+            break
+        }
+    }
+
+    func consumeVisionHighFive(at center: CGPoint) {
+        guard visionHighFivePending else { return }
+        visionHighFivePending = false
+        guard playSession?.activity == .highFive else { return }
+        hitPlayTarget(0, at: center)
+    }
+
+    func hitPlayTarget(_ index: Int, at center: CGPoint) {
+        guard voiceAvailable, settings?.focusing != true, var session = playSession, session.hits[index] == nil,
+              (0..<session.targetCount).contains(index) else { return }
+        let time = now
+        session.hits[index] = PlaySession.Hit(time: time, center: center)
+        playSession = session
+        if session.completed {
+            playback.react(session.activity == .bubbles ? .delighted : .happy, at: time, priority: .immediate)
+        }
+    }
+
+    func pet(toward point: CGPoint, distance: CGFloat) {
+        guard canPet else { return }
+        if strokeAttention == nil {
+            completedExpressionShow = nil
+            finishRotation(at: now)
+            clearTouch()
+        }
+        nextAmbientAt = nil
+        followUp = nil
+        strokeAttention = (point, min(1, max(strokeAttention?.strength ?? 0, 0.48 + distance / 115)))
+    }
+
+    func endPetting(completed: Bool) {
+        guard let strokeAttention else { return }
+        self.strokeAttention = nil
+        guard completed, canPet else { return }
+        var pose = pettingPose(strength: strokeAttention.strength)
+        pose.lookX = strokeAttention.point.x * 70
+        pose.lookY = strokeAttention.point.y * 25
+        if voice.phase == .idle {
+            playback.playPettingSmile(at: now, startingAt: pose)
+        } else {
+            tapAttention = (strokeAttention.point, now + 0.65)
+        }
+    }
+
+    func endPlay() {
+        playSession = nil
+        visionHighFivePending = false
+    }
+
+    private func clearTouch() {
+        tapAttention = nil
+        strokeAttention = nil
+        eyePoke = nil
     }
 
     func playVoiceReply(_ expression: PetExpression) {
@@ -297,10 +568,12 @@ final class PetDirector {
         nextAmbientAt = nil
         nextRotationAt = nil
         rotationTapQueued = false
-        tapAttention = nil
+        clearTouch()
+        endPlay()
         expressionShow = (program, 0)
         voice.cancel()
         modes.setExpressionShowActive(true)
+        configureSenses()
         updateAmbientAudio()
         refreshBaseline()
         playback.playShowStep(expression, at: time)
@@ -319,6 +592,7 @@ final class PetDirector {
         expressionShow = nil
         nextShowStepAt = nil
         modes.setExpressionShowActive(false)
+        configureSenses()
         updateAmbientAudio()
         refreshBaseline(interrupt: true)
     }
@@ -346,7 +620,16 @@ final class PetDirector {
         }
         var pose = motionEnabled ? playback.pose(at: time) : playback.stillPose(at: time)
         if expressionShow != nil { return pose }
-        if motionEnabled && settings?.mode != .nightLight {
+        if let eyePoke, time - eyePoke.started < 0.55 {
+            pose = PetExpression.idle.pose.blended(with: pose, progress: min(1, max(0, (time - eyePoke.started - 0.40) / 0.15)))
+            applyEyePoke(to: &pose, side: eyePoke.side, age: time - eyePoke.started, motionEnabled: motionEnabled)
+        } else if let strokeAttention, canPet {
+            pose = pettingPose(strength: strokeAttention.strength)
+            if motionEnabled {
+                pose.lookX = strokeAttention.point.x * 70
+                pose.lookY = strokeAttention.point.y * 25
+            }
+        } else if motionEnabled && settings?.mode != .nightLight {
             let gaze = senses.handTarget == nil ? senses.gaze : CGPoint(x: position.x * 9, y: position.y * 5)
             pose.lookX += gaze.x
             pose.lookY += gaze.y
@@ -358,6 +641,27 @@ final class PetDirector {
             pose.mouthOpen = max(pose.mouthOpen, motionEnabled ? CGFloat(voice.mouthOpen) : 0.3)
         }
         return pose
+    }
+
+    private func applyEyePoke(to pose: inout PetPose, side: EyeSide, age: TimeInterval, motionEnabled: Bool) {
+        let open = min(1, max(0, (age - 0.13) / 0.32))
+        let squeeze = CGFloat(1 - open * open * (3 - 2 * open))
+        let shut = EyePose(width: 0.9, height: 0.10, curve: 18, lidWeight: 8.5)
+        if side == .left {
+            pose.left = pose.left.blended(with: shut, progress: squeeze)
+        } else {
+            pose.right = pose.right.blended(with: shut, progress: squeeze)
+        }
+        if motionEnabled {
+            let direction: CGFloat = side == .left ? 1 : -1
+            pose.lookX += direction * 39 * squeeze
+            pose.lookY += 9 * squeeze
+            pose.turn += direction * 0.28 * squeeze
+        }
+    }
+
+    private func pettingPose(strength: CGFloat) -> PetPose {
+        PetExpression.idle.pose.blended(with: .pettingSmile, progress: strength)
     }
 
     private func marchElapsed(at time: TimeInterval) -> TimeInterval {
@@ -453,6 +757,10 @@ final class PetDirector {
     }
 
     func prepareForVoiceInput() {
+        endPlay()
+        clearTouch()
+        visionPointer = nil
+        visionHint = nil
         stopMarch()
         stopExpressionAudio()
         stopExpressionSoundSample()
@@ -470,7 +778,10 @@ final class PetDirector {
         stopExpressionAudio()
         stopExpressionSoundSample()
         voice.pauseWakeForExpressionAudio()
+        endPlay()
+        clearTouch()
         isPlayingMarch = true
+        configureSenses()
         guard let duration = petAudio.play(.march, onFinish: { [weak self] in self?.stopMarch() }) else {
             stopMarch()
             showNotice("圆圆暂时唱不了，稍后再试试。")
@@ -492,6 +803,7 @@ final class PetDirector {
     func stopMarch() {
         guard isPlayingMarch else { return }
         isPlayingMarch = false
+        configureSenses()
         marchDuration = 0
         modes.setMarchActive(false)
         petAudio.stop()
@@ -646,10 +958,13 @@ final class PetDirector {
 
     func updateOrientation() {
         guard let windowScene else { return }
-        if #available(iOS 26.0, *) {
-            senses.setOrientation(windowScene.effectiveGeometry.interfaceOrientation)
+        let orientation = if #available(iOS 26.0, *) {
+            windowScene.effectiveGeometry.interfaceOrientation
         } else {
-            senses.setOrientation(windowScene.interfaceOrientation)
+            windowScene.interfaceOrientation
+        }
+        if senses.setOrientation(orientation) {
+            visionPointer = nil
         }
     }
 
@@ -745,8 +1060,32 @@ final class PetDirector {
     }
 
     private func handle(_ stimulus: PetStimulus) {
+        switch stimulus {
+        case .wave, .closePalm:
+            guard reactionContextAllowed, !playback.isPreviewing(at: now) else { return }
+            if case .closePalm = stimulus, !voice.canRecord { return }
+            if let playSession {
+                // Holding the palm may have offered a high five before the intent was clear.
+                guard playSession.fromVision, playSession.activity == .highFive, playSession.hits.isEmpty else { return }
+                endPlay()
+            }
+            if case .wave = stimulus {
+                let time = now
+                finishRotation(at: time)
+                followUp = nil
+                nextRotationAt = nil
+                playback.react(.greeting, at: time, priority: .immediate)
+            } else {
+                onVoiceGesture?()
+            }
+            return
+        default: break
+        }
         let time = now
         if case .faceDown = stimulus {
+            clearTouch()
+            endPlay()
+            clearVisionPlay()
             stopMarch()
             stopExpressionAudio()
             stopExpressionSoundSample()
@@ -776,9 +1115,14 @@ final class PetDirector {
             case .faceReturned: react(.greeting, then: .happy, at: time)
             case .faceLost: playback.react(.peeking, at: time)
             case .searching: playback.react(.curious, at: time)
-            case .wave: playback.react(.greeting, at: time)
-            case .thumbsUp: playback.react(.thumbsUp, at: time)
-            case .heart: playback.react(.affectionate, at: time)
+            case .thumbsUp, .heart:
+                guard !playback.isPreviewing(at: time) else { return }
+                followUp = nil
+                if case .thumbsUp = stimulus {
+                    playback.react(.thumbsUp, at: time, priority: .immediate)
+                } else {
+                    playback.react(.affectionate, at: time, priority: .immediate)
+                }
             case .shake: playback.react(.dizzy, at: time)
             case .pickedUp: react(.surprised, then: .greeting, at: time)
             case .clap: playback.react(.surprised, at: time)

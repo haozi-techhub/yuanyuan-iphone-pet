@@ -355,6 +355,14 @@ struct PetPose {
     var accent: PetAccent = .none
     var accentOpacity: CGFloat = 1
 
+    static var pettingSmile: Self {
+        var pose = PetExpression.happy.pose
+        pose.left.height = 0.22
+        pose.right.height = 0.22
+        pose.cheeks = 0.95
+        return pose
+    }
+
     func blended(with end: Self, progress: CGFloat) -> Self {
         if progress <= 0 { return self }
         if progress >= 1 { return end }
@@ -545,6 +553,11 @@ struct PetPlayback {
         userUntil = time + expression.motionDuration
     }
 
+    mutating func playTapSmile(at time: TimeInterval, toward point: CGPoint) {
+        start(.happy, at: time, toward: point, kind: .tapSmile, duration: 0.94)
+        userUntil = time + selectionDuration
+    }
+
     mutating func show(_ expression: PetExpression, at time: TimeInterval, toward point: CGPoint = .zero) {
         start(expression, at: time, toward: point, kind: .preview)
         userUntil = time + expression.previewDuration
@@ -569,7 +582,7 @@ struct PetPlayback {
 
     enum ReactionPriority { case normal, immediate }
 
-    private enum SelectionKind { case reaction, preview, ambient, chargeCompletion, rotation, show, march }
+    private enum SelectionKind { case reaction, preview, ambient, chargeCompletion, rotation, show, march, petting, tapSmile }
 
     mutating func playAmbient(_ expression: PetExpression, at time: TimeInterval) {
         start(expression, at: time, kind: .ambient)
@@ -577,6 +590,12 @@ struct PetPlayback {
 
     mutating func playChargeCompletion(at time: TimeInterval) {
         start(.charged, at: time, kind: .chargeCompletion)
+    }
+
+    mutating func playPettingSmile(at time: TimeInterval, startingAt pose: PetPose) {
+        start(.happy, at: time, kind: .petting)
+        startPose = pose
+        userUntil = time + selectionDuration
     }
 
     mutating func playRotation(_ expression: PetExpression, variant: PetExpressionVariant, at time: TimeInterval) {
@@ -760,6 +779,14 @@ struct PetPlayback {
     }
 
     private func selectedPose(_ expression: PetExpression, pass: Pass, at elapsed: TimeInterval) -> PetPose {
+        if selectionKind == .tapSmile {
+            var pose = PetExpression.idle.pose.blended(with: expression.pose, progress: eased((elapsed - 0.19) / 0.22))
+            let gaze = 1 - eased((elapsed - 0.40) / 0.30)
+            pose.lookX = tapLook.x * gaze
+            pose.lookY = tapLook.y * gaze
+            pose.turn = max(-0.55, min(0.55, pose.lookX / 45))
+            return pose
+        }
         var pose = expression.poseWithTurn(at: elapsed, toward: tapLook, playbackDuration: pass.duration,
                                            variant: pass.variant)
         if expression == .freezing && !usesFreezingProps { pose.accent = .none }

@@ -9,6 +9,7 @@ struct PetFace: View {
     var eyeTint: Color? = nil
     var batteryLevel: Double? = nil
     var drawingSize: CGSize? = nil
+    var showsBubbleDecoration = true
     var centerOffset: CGSize = .zero
 
     var body: some View {
@@ -43,7 +44,9 @@ struct PetFace: View {
             if pose.spirals > 0 { drawSpirals(in: face) }
             if pose.sleep > 0 { drawSleep(in: face) }
             if pose.notes > 0 { drawNotes(in: face) }
-            if pose.accent != .none && pose.accentOpacity > 0.01 { drawAccent(in: face) }
+            if pose.accent != .none && pose.accentOpacity > 0.01 && (pose.accent != .bubbles || showsBubbleDecoration) {
+                drawAccent(in: face)
+            }
             if pose.confetti > 0 { drawCelebration(in: face) }
             if pose.glasses > 0 { drawGlasses(in: face) }
             if mouthEnabled && pose.mouth > 0 { drawMouth(in: face) }

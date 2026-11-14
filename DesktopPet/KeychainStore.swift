@@ -2,6 +2,18 @@ import Foundation
 import Security
 
 enum KeychainStore {
+    enum Account: String {
+        case deepSeek = "deepseek.apiKey"
+        case doubao = "doubao.voice.apiKey"
+
+        var serviceName: String {
+            switch self {
+            case .deepSeek: "DeepSeek"
+            case .doubao: "豆包语音"
+            }
+        }
+    }
+
     struct KeychainError: LocalizedError {
         let status: OSStatus
 
@@ -10,15 +22,15 @@ enum KeychainStore {
         }
     }
 
-    private static func keyQuery(account: String) -> [String: Any] {
+    private static func keyQuery(account: Account) -> [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: Bundle.main.bundleIdentifier ?? "com.haozi.desktoppet",
-            kSecAttrAccount as String: account
+            kSecAttrAccount as String: account.rawValue
         ]
     }
 
-    static func readAPIKey(account: String = "deepseek.apiKey") throws -> String? {
+    static func readAPIKey(account: Account) throws -> String? {
         var query = keyQuery(account: account)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -32,7 +44,7 @@ enum KeychainStore {
         return key
     }
 
-    static func saveAPIKey(_ key: String, account: String = "deepseek.apiKey") throws {
+    static func saveAPIKey(_ key: String, account: Account) throws {
         let query = keyQuery(account: account)
         let value = Data(key.utf8)
         let attributes = [kSecValueData as String: value]
@@ -48,7 +60,7 @@ enum KeychainStore {
         }
     }
 
-    static func removeAPIKey(account: String = "deepseek.apiKey") throws {
+    static func removeAPIKey(account: Account) throws {
         let status = SecItemDelete(keyQuery(account: account) as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw KeychainError(status: status)
