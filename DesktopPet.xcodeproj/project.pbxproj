@@ -1,0 +1,284 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		000000000000000000000021 /* DesktopPetApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000011 /* DesktopPetApp.swift */; };
+		000000000000000000000022 /* PetExpression.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000012 /* PetExpression.swift */; };
+		000000000000000000000023 /* PetFace.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000013 /* PetFace.swift */; };
+		000000000000000000000024 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000014 /* Assets.xcassets */; };
+		000000000000000000000025 /* PetDirector.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000017 /* PetDirector.swift */; };
+		000000000000000000000026 /* PetSenses.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000018 /* PetSenses.swift */; };
+		000000000000000000000027 /* MotionSense.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000019 /* MotionSense.swift */; };
+		000000000000000000000028 /* SoundSense.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00000000000000000000001A /* SoundSense.swift */; };
+		000000000000000000000029 /* PetModes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00000000000000000000001B /* PetModes.swift */; };
+		00000000000000000000002A /* PetVoice.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00000000000000000000001C /* PetVoice.swift */; };
+		00000000000000000000002B /* DeepSeekClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00000000000000000000001D /* DeepSeekClient.swift */; };
+		00000000000000000000002C /* KeychainStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00000000000000000000001E /* KeychainStore.swift */; };
+		00000000000000000000002D /* PetScreenOrientation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00000000000000000000001F /* PetScreenOrientation.swift */; };
+		00000000000000000000002E /* LocalTTSClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000020 /* LocalTTSClient.swift */; };
+		00000000000000000000002F /* OfflineVoice in Resources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000040 /* OfflineVoice */; };
+		000000000000000000000045 /* PetAudioPlayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000047 /* PetAudioPlayer.swift */; };
+		000000000000000000000046 /* PetAudio in Resources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000048 /* PetAudio */; };
+		00000000000000000000004B /* PetFocusTimer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000049 /* PetFocusTimer.swift */; };
+		00000000000000000000004C /* PetCatchGame.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00000000000000000000004A /* PetCatchGame.swift */; };
+		000000000000000000000041 /* sherpa-onnx in Frameworks */ = {isa = PBXBuildFile; productRef = 000000000000000000000043 /* sherpa-onnx */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		000000000000000000000011 /* DesktopPetApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesktopPetApp.swift; sourceTree = "<group>"; };
+		000000000000000000000012 /* PetExpression.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PetExpression.swift; sourceTree = "<group>"; };
+		000000000000000000000013 /* PetFace.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PetFace.swift; sourceTree = "<group>"; };
+		000000000000000000000014 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		000000000000000000000015 /* DesktopPet.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; path = DesktopPet.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		000000000000000000000016 /* DesktopPet.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = DesktopPet.xcconfig; sourceTree = SOURCE_ROOT; };
+		000000000000000000000017 /* PetDirector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PetDirector.swift; sourceTree = "<group>"; };
+		000000000000000000000018 /* PetSenses.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PetSenses.swift; sourceTree = "<group>"; };
+		000000000000000000000019 /* MotionSense.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MotionSense.swift; sourceTree = "<group>"; };
+		00000000000000000000001A /* SoundSense.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SoundSense.swift; sourceTree = "<group>"; };
+		00000000000000000000001B /* PetModes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PetModes.swift; sourceTree = "<group>"; };
+		00000000000000000000001C /* PetVoice.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PetVoice.swift; sourceTree = "<group>"; };
+		00000000000000000000001D /* DeepSeekClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeepSeekClient.swift; sourceTree = "<group>"; };
+		00000000000000000000001E /* KeychainStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainStore.swift; sourceTree = "<group>"; };
+		00000000000000000000001F /* PetScreenOrientation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PetScreenOrientation.swift; sourceTree = "<group>"; };
+		000000000000000000000020 /* LocalTTSClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalTTSClient.swift; sourceTree = "<group>"; };
+		000000000000000000000040 /* OfflineVoice */ = {isa = PBXFileReference; lastKnownFileType = folder; path = OfflineVoice; sourceTree = "<group>"; };
+		000000000000000000000047 /* PetAudioPlayer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PetAudioPlayer.swift; sourceTree = "<group>"; };
+		000000000000000000000048 /* PetAudio */ = {isa = PBXFileReference; lastKnownFileType = folder; path = PetAudio; sourceTree = "<group>"; };
+		000000000000000000000049 /* PetFocusTimer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PetFocusTimer.swift; sourceTree = "<group>"; };
+		00000000000000000000004A /* PetCatchGame.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PetCatchGame.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		000000000000000000000044 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				000000000000000000000041 /* sherpa-onnx in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		000000000000000000000002 = {
+			isa = PBXGroup;
+			children = (
+				000000000000000000000003 /* DesktopPet */,
+				000000000000000000000016 /* DesktopPet.xcconfig */,
+				000000000000000000000004 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		000000000000000000000003 /* DesktopPet */ = {
+			isa = PBXGroup;
+			children = (
+				000000000000000000000011 /* DesktopPetApp.swift */,
+				000000000000000000000012 /* PetExpression.swift */,
+				000000000000000000000013 /* PetFace.swift */,
+				000000000000000000000017 /* PetDirector.swift */,
+				000000000000000000000049 /* PetFocusTimer.swift */,
+				00000000000000000000004A /* PetCatchGame.swift */,
+				000000000000000000000018 /* PetSenses.swift */,
+				000000000000000000000019 /* MotionSense.swift */,
+				00000000000000000000001A /* SoundSense.swift */,
+				00000000000000000000001B /* PetModes.swift */,
+				00000000000000000000001C /* PetVoice.swift */,
+				00000000000000000000001D /* DeepSeekClient.swift */,
+				000000000000000000000020 /* LocalTTSClient.swift */,
+				000000000000000000000040 /* OfflineVoice */,
+				000000000000000000000047 /* PetAudioPlayer.swift */,
+				000000000000000000000048 /* PetAudio */,
+				00000000000000000000001E /* KeychainStore.swift */,
+				00000000000000000000001F /* PetScreenOrientation.swift */,
+				000000000000000000000014 /* Assets.xcassets */,
+			);
+			path = DesktopPet;
+			sourceTree = "<group>";
+		};
+		000000000000000000000004 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				000000000000000000000015 /* DesktopPet.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		000000000000000000000005 /* DesktopPet */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 000000000000000000000009 /* Build configuration list for PBXNativeTarget "DesktopPet" */;
+			buildPhases = (
+				000000000000000000000006 /* Sources */,
+				000000000000000000000044 /* Frameworks */,
+				000000000000000000000007 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = DesktopPet;
+			packageProductDependencies = (
+				000000000000000000000043 /* sherpa-onnx */,
+			);
+			productName = DesktopPet;
+			productReference = 000000000000000000000015 /* DesktopPet.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		000000000000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				LastSwiftUpdateCheck = 2600;
+				LastUpgradeCheck = 2600;
+			};
+			buildConfigurationList = 000000000000000000000008 /* Build configuration list for PBXProject "DesktopPet" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = "zh-Hans";
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				"zh-Hans",
+				en,
+				Base,
+			);
+			mainGroup = 000000000000000000000002;
+			packageReferences = (
+				000000000000000000000042 /* XCRemoteSwiftPackageReference "sherpa-onnx" */,
+			);
+			productRefGroup = 000000000000000000000004 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				000000000000000000000005 /* DesktopPet */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		000000000000000000000007 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				000000000000000000000024 /* Assets.xcassets in Resources */,
+				00000000000000000000002F /* OfflineVoice in Resources */,
+				000000000000000000000046 /* PetAudio in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		000000000000000000000006 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				000000000000000000000021 /* DesktopPetApp.swift in Sources */,
+				000000000000000000000022 /* PetExpression.swift in Sources */,
+				000000000000000000000023 /* PetFace.swift in Sources */,
+				000000000000000000000025 /* PetDirector.swift in Sources */,
+				00000000000000000000004B /* PetFocusTimer.swift in Sources */,
+				00000000000000000000004C /* PetCatchGame.swift in Sources */,
+				000000000000000000000026 /* PetSenses.swift in Sources */,
+				000000000000000000000027 /* MotionSense.swift in Sources */,
+				000000000000000000000028 /* SoundSense.swift in Sources */,
+				000000000000000000000029 /* PetModes.swift in Sources */,
+				00000000000000000000002A /* PetVoice.swift in Sources */,
+				00000000000000000000002B /* DeepSeekClient.swift in Sources */,
+				00000000000000000000002E /* LocalTTSClient.swift in Sources */,
+				000000000000000000000045 /* PetAudioPlayer.swift in Sources */,
+				00000000000000000000002C /* KeychainStore.swift in Sources */,
+				00000000000000000000002D /* PetScreenOrientation.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		000000000000000000000042 /* XCRemoteSwiftPackageReference "sherpa-onnx" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/k2-fsa/sherpa-onnx.git";
+			requirement = {
+				kind = exactVersion;
+				version = 2.0.1;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		000000000000000000000043 /* sherpa-onnx */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 000000000000000000000042 /* XCRemoteSwiftPackageReference "sherpa-onnx" */;
+			productName = "sherpa-onnx";
+		};
+/* End XCSwiftPackageProductDependency section */
+
+/* Begin XCBuildConfiguration section */
+		000000000000000000000031 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				SDKROOT = iphoneos;
+			};
+			name = Debug;
+		};
+		000000000000000000000032 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				SDKROOT = iphoneos;
+			};
+			name = Release;
+		};
+		000000000000000000000033 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 000000000000000000000016 /* DesktopPet.xcconfig */;
+			buildSettings = {
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = 4MW6855TY9;
+				ENABLE_DEBUG_DYLIB = NO;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		000000000000000000000034 /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 000000000000000000000016 /* DesktopPet.xcconfig */;
+			buildSettings = {
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = 4MW6855TY9;
+				SWIFT_COMPILATION_MODE = wholemodule;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		000000000000000000000008 /* Build configuration list for PBXProject "DesktopPet" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				000000000000000000000031 /* Debug */,
+				000000000000000000000032 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		000000000000000000000009 /* Build configuration list for PBXNativeTarget "DesktopPet" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				000000000000000000000033 /* Debug */,
+				000000000000000000000034 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 000000000000000000000001 /* Project object */;
+}

@@ -1,0 +1,9 @@
+.DS_Store
+DerivedData/
+xcuserdata/
+*.xcuserstate
+
+# 本地备份和调研素材
+/圆圆桌宠项目.zip
+/NOMI 调研/
+/design-preview/
