@@ -81,73 +81,58 @@ struct PetFace: View {
         let curvedLid = min(1, max(0, (abs(bend) - 0.35) / 0.45))
         let openLimit = 0.43 + curvedLid * 0.08
         let closedLimit = 0.19 + curvedLid * 0.13
-        let progress = min(1, max(0, (openLimit - openness) / (openLimit - closedLimit)))
-        let closed = progress * progress * (3 - 2 * progress)
-        let width = (35 + closed * (-13 + 13 * abs(bend))) * widthScale
-        // Keep a partially open eye round until the lids nearly meet.
-        let arc = bend * (3 + 27 * closed * closed)
-        let endpoint = 6 * closed * (1 - abs(bend)) - arc * 0.25
-        let apex = endpoint + arc
-        let crestX = (24 - closed * 7) * widthScale
-        let shoulderDistance = 9 * widthScale
-        let shoulderRise = -arc * 0.58
+        let closed = smoothProgress((openLimit - openness) / (openLimit - closedLimit))
+        // Fill out every curved lid as it closes, including curves set by animation keyframes.
+        let fullness = smoothProgress(abs(bend) / 0.30)
         let radius = strokeWeight / 2
+        let closedThickness = radius * 1.08 + 3 * fullness
+        let thickness = (1 - closed) * 53 * openness + closed * closedThickness
+        let openWidth = 35 * widthScale
+        let closedWidth = (22 + 13 * abs(bend)) * widthScale + radius * 0.85
+        let halfWidth = openWidth + (closedWidth - openWidth) * closed
+        let arc = 30 * bend * closed * closed * closed
+        let centerY = 6 * closed * (1 - abs(bend)) + arc * 0.75
+        let cornerRoundness = 0.48 * closed
+        let taper = (0.09 - 0.19 * fullness) * closed
 
-        if closed == 1 {
-            let line = Path { path in
-                path.move(to: CGPoint(x: -width, y: endpoint))
-                path.addCurve(to: CGPoint(x: 0, y: apex),
-                              control1: CGPoint(x: -width + shoulderDistance, y: endpoint - shoulderRise),
-                              control2: CGPoint(x: -crestX, y: apex))
-                path.addCurve(to: CGPoint(x: width, y: endpoint),
-                              control1: CGPoint(x: crestX, y: apex),
-                              control2: CGPoint(x: width - shoulderDistance, y: endpoint - shoulderRise))
-            }
-            context.stroke(line, with: .color(color),
-                           style: StrokeStyle(lineWidth: strokeWeight, lineCap: .round, lineJoin: .round))
-            return
+        // Bend one continuous oval. Spreading the turn across its sides lets the lids
+        // taper into the tips without a separate end cap.
+        func outlinePoint(at angle: CGFloat) -> (point: CGPoint, tangent: CGVector) {
+            let horizontal = sin(angle)
+            let vertical = cos(angle)
+            let x = horizontal * (1 + cornerRoundness * vertical * vertical)
+            let dx = vertical * (1 + cornerRoundness * (1 - 3 * horizontal * horizontal))
+            let taperScale = 1 - taper * horizontal * horizontal
+            let offset = thickness * vertical * taperScale
+            let offsetRate = -thickness * horizontal * (taperScale + 2 * taper * vertical * vertical)
+            let normalX = 2 * arc * x / halfWidth
+            let normalScale = 1 / hypot(1, normalX)
+            let normal = CGVector(dx: normalX * normalScale, dy: normalScale)
+            let normalRate = (2 * arc * dx / halfWidth) * normalScale * normalScale * normalScale
+            return (
+                CGPoint(x: halfWidth * x + offset * normal.dx,
+                        y: centerY - arc * x * x + offset * normal.dy),
+                CGVector(dx: halfWidth * dx + offsetRate * normal.dx + offset * normalRate,
+                         dy: -2 * arc * x * dx + offsetRate * normal.dy - offset * normalX * normalRate)
+            )
         }
 
-        // Both lids meet the end cap along its tangent, even during a partial blink.
-        let thickness = (1 - closed) * 53 * openness + closed * radius
-        let direction = atan2(shoulderRise, shoulderDistance) * closed
-        let sweep = .pi / 2 * closed
-        let capHalfHeight = radius * sin(sweep)
-        let normal = CGPoint(x: -sin(direction) * capHalfHeight, y: cos(direction) * capHalfHeight)
-        let upperCorner = CGPoint(x: width - normal.x, y: endpoint - normal.y)
-        let lowerCorner = CGPoint(x: width + normal.x, y: endpoint + normal.y)
-        let upperAngle = direction + .pi / 2 - sweep
-        let lowerAngle = direction + .pi / 2 + sweep
-        let upperTangent = CGPoint(x: cos(upperAngle), y: sin(upperAngle))
-        let lowerTangent = CGPoint(x: cos(lowerAngle), y: sin(lowerAngle))
-        let lidHandle = (1 - closed) * 30 * openness + closed * hypot(shoulderDistance, shoulderRise)
-        let capHandle = 4.0 / 3 * radius * tan(sweep / 2)
-
-        func offset(_ point: CGPoint, along tangent: CGPoint, by length: CGFloat) -> CGPoint {
-            CGPoint(x: point.x + tangent.x * length, y: point.y + tangent.y * length)
-        }
-        func reflected(_ point: CGPoint) -> CGPoint { CGPoint(x: -point.x, y: point.y) }
-
-        let upperShoulder = offset(upperCorner, along: upperTangent, by: -lidHandle)
-        let lowerShoulder = offset(lowerCorner, along: lowerTangent, by: lidHandle)
-        let upperCap = offset(upperCorner, along: upperTangent, by: capHandle)
-        let lowerCap = offset(lowerCorner, along: lowerTangent, by: -capHandle)
-        let upper = apex - thickness
-        let lower = apex + thickness
-
+        let sections = 16
+        let step = 2 * CGFloat.pi / CGFloat(sections)
+        let handle = step / 3
         let outline = Path { path in
-            path.move(to: CGPoint(x: 0, y: upper))
-            path.addCurve(to: upperCorner,
-                          control1: CGPoint(x: crestX, y: upper), control2: upperShoulder)
-            path.addCurve(to: lowerCorner, control1: upperCap, control2: lowerCap)
-            path.addCurve(to: CGPoint(x: 0, y: lower),
-                          control1: lowerShoulder, control2: CGPoint(x: crestX, y: lower))
-            path.addCurve(to: reflected(lowerCorner),
-                          control1: CGPoint(x: -crestX, y: lower), control2: reflected(lowerShoulder))
-            path.addCurve(to: reflected(upperCorner),
-                          control1: reflected(lowerCap), control2: reflected(upperCap))
-            path.addCurve(to: CGPoint(x: 0, y: upper),
-                          control1: reflected(upperShoulder), control2: CGPoint(x: -crestX, y: upper))
+            let start = outlinePoint(at: 0)
+            var previous = start
+            path.move(to: start.point)
+            for index in 1...sections {
+                let next = index == sections ? start : outlinePoint(at: CGFloat(index) * step)
+                path.addCurve(to: next.point,
+                              control1: CGPoint(x: previous.point.x + previous.tangent.dx * handle,
+                                                y: previous.point.y + previous.tangent.dy * handle),
+                              control2: CGPoint(x: next.point.x - next.tangent.dx * handle,
+                                                y: next.point.y - next.tangent.dy * handle))
+                previous = next
+            }
             path.closeSubpath()
         }
         context.fill(outline, with: .color(color))
@@ -178,15 +163,15 @@ struct PetFace: View {
     }
 
     private func drawStars(in context: GraphicsContext) {
-        let expansion = min(1, elapsed / 0.21)
-        let settle = min(1, max(0, (elapsed - 0.21) / 0.13))
+        let expansion = smoothProgress(elapsed / 0.21)
+        let settle = smoothProgress((elapsed - 0.21) / 0.13)
         let scale = motionEnabled ? 0.72 + 0.40 * expansion - 0.12 * settle : 1
         let vertices = (0..<10).map { index in
             let angle = Double(index) * .pi / 5 - .pi / 2
             let radius: CGFloat = index.isMultiple(of: 2) ? 30 : 18
             return CGPoint(x: cos(angle) * radius, y: sin(angle) * radius)
         }
-        let star = roundedPolygon(vertices, cornerFraction: 0.30)
+        let star = roundedPolygon(vertices, cornerFraction: 0.44)
         let ivory = Color(hex: 0xFFF6D0)
         for x in [-76.0, 76.0] {
             var eye = context
@@ -202,19 +187,28 @@ struct PetFace: View {
 
     private func roundedPolygon(_ vertices: [CGPoint], cornerFraction: CGFloat) -> Path {
         guard let first = vertices.first, let last = vertices.last, vertices.count > 2 else { return Path() }
-        func inset(_ vertex: CGPoint, toward neighbor: CGPoint) -> CGPoint {
-            CGPoint(x: vertex.x + (neighbor.x - vertex.x) * cornerFraction,
-                    y: vertex.y + (neighbor.y - vertex.y) * cornerFraction)
+        func toward(_ end: CGPoint, from start: CGPoint, by amount: CGFloat) -> CGPoint {
+            CGPoint(x: start.x + (end.x - start.x) * amount,
+                    y: start.y + (end.y - start.y) * amount)
         }
 
         return Path { path in
-            path.move(to: inset(first, toward: last))
+            path.move(to: toward(last, from: first, by: cornerFraction))
             for index in vertices.indices {
                 let vertex = vertices[index]
                 let previous = vertices[(index + vertices.count - 1) % vertices.count]
                 let next = vertices[(index + 1) % vertices.count]
-                if index > 0 { path.addLine(to: inset(vertex, toward: previous)) }
-                path.addQuadCurve(to: inset(vertex, toward: next), control: vertex)
+                let start = toward(previous, from: vertex, by: cornerFraction)
+                let end = toward(next, from: vertex, by: cornerFraction)
+                let incoming = toward(vertex, from: start, by: 0.50)
+                let outgoing = toward(vertex, from: end, by: 0.50)
+                let midpoint = toward(outgoing, from: incoming, by: 0.50)
+                if index > 0 { path.addLine(to: start) }
+                // Both handles start on the straight edge so each corner bends in gradually.
+                path.addCurve(to: midpoint, control1: toward(vertex, from: start, by: 0.28),
+                              control2: incoming)
+                path.addCurve(to: end, control1: outgoing,
+                              control2: toward(vertex, from: end, by: 0.28))
             }
             path.closeSubpath()
         }
@@ -234,10 +228,10 @@ struct PetFace: View {
     private var heartShape: Path {
         Path { path in
             path.move(to: CGPoint(x: 0, y: -13))
-            path.addCurve(to: CGPoint(x: 34, y: -9), control1: CGPoint(x: 6, y: -13), control2: CGPoint(x: 34, y: -40))
-            path.addCurve(to: CGPoint(x: 0, y: 29), control1: CGPoint(x: 34, y: 9), control2: CGPoint(x: 7, y: 29))
-            path.addCurve(to: CGPoint(x: -34, y: -9), control1: CGPoint(x: -7, y: 29), control2: CGPoint(x: -34, y: 9))
-            path.addCurve(to: CGPoint(x: 0, y: -13), control1: CGPoint(x: -34, y: -40), control2: CGPoint(x: -6, y: -13))
+            path.addCurve(to: CGPoint(x: 34, y: -9), control1: CGPoint(x: 13, y: -13), control2: CGPoint(x: 34, y: -39))
+            path.addCurve(to: CGPoint(x: 0, y: 29), control1: CGPoint(x: 34, y: 9), control2: CGPoint(x: 11, y: 29))
+            path.addCurve(to: CGPoint(x: -34, y: -9), control1: CGPoint(x: -11, y: 29), control2: CGPoint(x: -34, y: 9))
+            path.addCurve(to: CGPoint(x: 0, y: -13), control1: CGPoint(x: -34, y: -39), control2: CGPoint(x: -13, y: -13))
             path.closeSubpath()
         }
     }
@@ -300,27 +294,45 @@ struct PetFace: View {
             }
         case .wink:
             icon("sparkle", at: CGPoint(x: -131, y: -35), size: 32, color: 0xFFE2A2)
+        case .listen:
+            let mint = Color(hex: 0x8FE9DB)
+            let breath = motionEnabled ? (1 - cos(time * 2.1)) / 2 : 0.5
+            for index in 0..<2 {
+                let step = Double(index)
+                let x = 133 + step * 10 + breath * 3
+                let halfHeight = 11 + step * 7
+                let wave = Path { path in
+                    path.move(to: CGPoint(x: x, y: -13 - halfHeight))
+                    path.addQuadCurve(to: CGPoint(x: x, y: -13 + halfHeight),
+                                      control: CGPoint(x: x + 10 + step * 3, y: -13))
+                }
+                let opacity = strength * (0.48 + 0.24 * breath - step * 0.12)
+                context.stroke(wave, with: .color(mint.opacity(opacity)),
+                               style: StrokeStyle(lineWidth: 4, lineCap: .round))
+            }
         case .thought:
             for index in 0..<3 {
                 let step = Double(index)
-                let active = (Int(time * 4) % 3) == index
+                let pulse = PetActionGeometry.thoughtPulse(at: time, index: index, motionEnabled: motionEnabled)
                 icon("circle.fill", at: CGPoint(x: 126 + 18 * step, y: -48 - 7 * step),
-                     size: active ? 13 : 8, color: 0xD6C9FF, alpha: active ? 1 : 0.58)
+                     size: 8 + 5 * pulse, color: 0xD6C9FF, alpha: 0.58 + 0.42 * pulse)
             }
         case .question:
             icon("questionmark", at: CGPoint(x: 122, y: -52), size: 39, color: 0xF1C9FF)
             icon("questionmark", at: CGPoint(x: 157, y: -25), size: 23, color: 0xB498FF, alpha: 0.84)
         case .peek:
-            let side: CGFloat = pose.lookX < 0 ? 1 : -1
-            icon("sparkle", at: CGPoint(x: side * 133, y: -47), size: 23, color: 0xB5FFD9)
+            let right = smoothProgress(0.5 - pose.lookX / 64)
+            icon("sparkle", at: CGPoint(x: 133, y: -47), size: 23, color: 0xB5FFD9, alpha: right)
+            icon("sparkle", at: CGPoint(x: -133, y: -47), size: 23, color: 0xB5FFD9, alpha: 1 - right)
         case .yawn:
             icon("moon.stars.fill", at: CGPoint(x: 139, y: -45), size: 39, color: 0xD2C2FF)
         case .kiss:
             for index in 0..<3 {
                 let step = Double(index)
                 let travel = PetActionGeometry.kissProgress(at: time - step * 0.13)
+                let visibility = PetActionGeometry.kissVisibility(at: travel, motionEnabled: motionEnabled)
                 icon("heart.fill", at: PetActionGeometry.kissPosition(progress: travel),
-                     size: 26 - step * 4, color: 0xFF78B6, alpha: (1 - travel * 0.57) * (1 - step * 0.11))
+                     size: 26 - step * 4, color: 0xFF78B6, alpha: visibility * (1 - step * 0.11))
             }
         case .hungry:
             icon("carrot.fill", at: CGPoint(x: 140, y: -26 + sin(time * 5) * 5), size: 45, color: 0xFFAF65)
@@ -329,10 +341,12 @@ struct PetFace: View {
             for index in 0..<6 {
                 let step = Double(index)
                 let travel = (time * 1.75 + step * 0.16).truncatingRemainder(dividingBy: 1)
+                let visibility = PetActionGeometry.particleVisibility(at: travel, fadeIn: 0.12, fadeOut: 0.28)
                 let direction = index.isMultiple(of: 2) ? -1.0 : 1.0
                 icon("circle.fill", at: CGPoint(x: direction * (19 + 43 * travel),
                                                y: 52 - sin(travel * .pi) * (18 + step * 2)),
-                     size: 6 + step.truncatingRemainder(dividingBy: 3), color: 0xFFC27D, alpha: 1 - travel * 0.76)
+                     size: 6 + step.truncatingRemainder(dividingBy: 3), color: 0xFFC27D,
+                     alpha: visibility * (1 - travel * 0.65))
             }
         case .bubbles:
             for index in 0..<4 {
@@ -341,7 +355,7 @@ struct PetFace: View {
                 var center = PetActionGeometry.bubblePosition(progress: travel)
                 center.y += sin(step * 2) * 8
                 let radius = 9 + travel * 14 - step
-                let alpha = strength * min(1, travel * 13) * (1 - travel * 0.42)
+                let alpha = strength * PetActionGeometry.bubbleVisibility(at: travel)
                 let bounds = CGRect(x: center.x - radius, y: center.y - radius, width: radius * 2, height: radius * 2)
                 let bubble = Path(ellipseIn: bounds)
                 context.fill(bubble, with: .color(Color(hex: 0x719AFF).opacity(alpha * 0.12)))
@@ -355,8 +369,10 @@ struct PetFace: View {
             for index in 0..<5 {
                 let step = Double(index)
                 let drift = (time * 0.43 + step * 0.2).truncatingRemainder(dividingBy: 1)
+                let visibility = PetActionGeometry.particleVisibility(at: drift, fadeIn: 0.12, fadeOut: 0.20)
                 icon("snowflake", at: CGPoint(x: -154 + step * 77 + sin(drift * .pi * 2) * 9, y: -68 + drift * 123),
-                     size: 13 + step.truncatingRemainder(dividingBy: 3) * 4, color: 0xAAEEFF, alpha: 0.85 - drift * 0.32)
+                     size: 13 + step.truncatingRemainder(dividingBy: 3) * 4, color: 0xAAEEFF,
+                     alpha: visibility * (0.85 - drift * 0.32))
             }
         case .dance:
             for side in [-1.0, 1.0] {
@@ -368,7 +384,7 @@ struct PetFace: View {
         case .power:
             let bolt = roundedPolygon([CGPoint(x: 7, y: -31), CGPoint(x: -23, y: 2),
                                        CGPoint(x: -3, y: 2), CGPoint(x: -7, y: 31),
-                                       CGPoint(x: 23, y: -3), CGPoint(x: 3, y: -3)], cornerFraction: 0.24)
+                                      CGPoint(x: 23, y: -3), CGPoint(x: 3, y: -3)], cornerFraction: 0.40)
             let scale = 1 + sin(time * 10) * 0.06
             for x in [-76.0, 76.0] {
                 var eye = context
@@ -565,10 +581,13 @@ struct PetFace: View {
         }
         layer.stroke(cable, with: .color(green.opacity(0.46)),
                      style: StrokeStyle(lineWidth: 4, lineCap: .round))
-        if reach >= 1 {
-            let flow = motionEnabled ? ((time - 0.82) / 0.60).truncatingRemainder(dividingBy: 1) : 0.45
-            layer.stroke(cable.trimmedPath(from: max(0, 0.82 - flow), to: 1 - flow),
-                         with: .color(Color(hex: 0xDEFFF2)),
+        let connectedTime = max(0, time - 0.82)
+        if connectedTime > 0 {
+            let flow = motionEnabled ? (connectedTime / 0.72).truncatingRemainder(dividingBy: 1) : 0.45
+            let head = 1.18 * (1 - flow)
+            let intensity = PetActionGeometry.particleVisibility(at: flow, fadeIn: 0.14, fadeOut: 0.16)
+            layer.stroke(cable.trimmedPath(from: min(1, max(0, head - 0.18)), to: min(1, head)),
+                         with: .color(Color(hex: 0xDEFFF2).opacity(intensity)),
                          style: StrokeStyle(lineWidth: 4.5, lineCap: .round))
         }
 
@@ -578,7 +597,8 @@ struct PetFace: View {
         layer.fill(Path(roundedRect: CGRect(x: 60, y: 45, width: 7, height: 12), cornerRadius: 2),
                    with: .color(green.opacity(0.86)))
 
-        let phase = max(0, time - 0.82).truncatingRemainder(dividingBy: 1.38)
+        let phase = connectedTime.truncatingRemainder(dividingBy: 1.38)
+        let reset = 1 - smoothProgress((phase - 1.04) / 0.34)
         for index in 0..<4 {
             let bar = CGRect(x: -51 + CGFloat(index) * 26, y: 42, width: 21, height: 18)
             let outline = Path(roundedRect: bar, cornerRadius: 3)
@@ -592,8 +612,8 @@ struct PetFace: View {
                     filledLayer.fill(outline, with: .color(green.opacity(0.92)))
                 }
             } else {
-                let active = reach >= 1 && phase >= Double(index) * 0.26
-                layer.fill(outline, with: .color(green.opacity(active ? 0.92 : 0.14)))
+                let lit = smoothProgress((phase - Double(index) * 0.23) / 0.17) * reset
+                layer.fill(outline, with: .color(green.opacity(0.14 + 0.78 * lit)))
             }
         }
 
@@ -731,7 +751,7 @@ struct PetFace: View {
 
     private func drawCelebration(in context: GraphicsContext) {
         let colors = [0x31B8F2, 0xF84994, 0xFFAD4E, 0x4C75FF, 0x63E3C9, 0xFFF2D8]
-        let recoil = motionEnabled ? max(0, 1 - abs(elapsed - 0.27) / 0.11) : 0
+        let recoil = motionEnabled ? smoothProgress(1 - abs(elapsed - 0.27) / 0.11) : 0
         let cone = Path { path in
             path.move(to: CGPoint(x: -22, y: -20))
             path.addCurve(to: CGPoint(x: 11, y: -8), control1: CGPoint(x: -19, y: -24), control2: CGPoint(x: 1, y: -17))
@@ -793,12 +813,12 @@ struct PetFace: View {
 
     private func drawGlasses(in context: GraphicsContext) {
         var glasses = context
-        let drop = min(1, elapsed / 0.24)
-        let rebound = max(0, 1 - abs(elapsed - 0.25) / 0.045)
+        let drop = smoothProgress(elapsed / 0.24)
+        let rebound = smoothProgress(1 - abs(elapsed - 0.25) / 0.045)
         let push = motionEnabled ? smoothProgress((elapsed - 0.47) / 0.18) : 1
         let settle = motionEnabled ? smoothProgress((elapsed - 0.65) / 0.15) : 1
         let tilt = motionEnabled ? -3 * smoothProgress((elapsed - 0.29) / 0.16) * (1 - push) + 2 * push * (1 - settle) : 0
-        let offset = motionEnabled ? -66 * (1 - drop * drop) + 4 * rebound + 5 * (1 - push) - 5 * push * (1 - settle) : 0
+        let offset = motionEnabled ? -66 * (1 - drop) + 4 * rebound + 5 * (1 - push) - 5 * push * (1 - settle) : 0
         glasses.translateBy(x: 0, y: offset)
         glasses.rotate(by: .degrees(tilt))
         glasses.opacity = pose.glasses
@@ -810,15 +830,9 @@ struct PetFace: View {
         }
         glasses.stroke(bridge, with: .color(white), style: StrokeStyle(lineWidth: 11, lineCap: .round))
 
-        let frame = Path { path in
-            path.move(to: CGPoint(x: -45, y: -28))
-            path.addLine(to: CGPoint(x: 45, y: -28))
-            path.addLine(to: CGPoint(x: 43, y: 4))
-            path.addQuadCurve(to: CGPoint(x: 21, y: 34), control: CGPoint(x: 39, y: 34))
-            path.addLine(to: CGPoint(x: -21, y: 34))
-            path.addQuadCurve(to: CGPoint(x: -43, y: 4), control: CGPoint(x: -39, y: 34))
-            path.closeSubpath()
-        }
+        let frame = UnevenRoundedRectangle(topLeadingRadius: 13, bottomLeadingRadius: 23,
+                                           bottomTrailingRadius: 23, topTrailingRadius: 13, style: .continuous)
+            .path(in: CGRect(x: -45, y: -28, width: 90, height: 62))
         let shading = Gradient(colors: [Color(hex: 0x0D0C16), Color(hex: 0x423D4F)])
         for x in [-65.0, 65.0] {
             var lens = glasses
@@ -901,76 +915,84 @@ struct PetFace: View {
     }
 
     private func drawMouth(in context: GraphicsContext) {
-        let opening = pose.mouthOpen
+        let opening = min(1, max(0, pose.mouthOpen))
         let roundness = pose.mouthRound
         let width = (17 + 6 * max(0, pose.mouthCurve) + 3 * opening) * (1 - roundness * 0.45)
         let y: CGFloat = 64 - opening * 3
-        let curve = pose.mouthCurve * 13
-        let left = CGPoint(x: -width, y: y + pose.smirk * 3)
-        let right = CGPoint(x: width, y: y - pose.smirk * 5)
+        let curve = pose.mouthCurve * 9.75
+        let centerY = y + curve + opening * (6 - 5 * roundness) - pose.smirk
+        let bend = curve * (1 - 0.8 * smoothProgress(opening / 0.7))
+        let tilt = pose.smirk * -4
+        let openingHeight = opening * (11 + 5 * roundness)
         let lip = Color(hex: 0xFFF6F1)
         var mouth = context
         mouth.opacity = pose.mouth * min(1, pose.brightness)
 
-        let contour = mouthContour(left: left, right: right, centerY: y, curve: curve,
-                                   opening: opening, roundness: roundness)
+        let contour = mouthContour(width: width + 1.6, centerY: centerY, bend: bend,
+                                   tilt: tilt, halfHeight: openingHeight + 1.6)
 
         var glow = mouth
         glow.addFilter(.blur(radius: 4))
-        glow.stroke(contour, with: .color(lip.opacity(0.38)),
-                    style: StrokeStyle(lineWidth: 4, lineCap: .round, lineJoin: .round))
-        if opening > 0.01 {
-            mouth.fill(contour, with: .color(Color(hex: 0x3B2531).opacity(min(1, opening * 3))))
-            if pose.mouthTongue > 0.01 {
-                var interior = mouth
-                interior.clip(to: contour)
-                let tongueY = y + curve * 0.65 + opening * 10
-                let tongue = Path(ellipseIn: CGRect(x: -width * 0.57, y: tongueY,
-                                                    width: width * 1.14, height: opening * 19))
-                interior.fill(tongue, with: .color(Color(hex: 0xFF93B0).opacity(pose.mouthTongue * opening)))
-            }
+        glow.fill(contour, with: .color(lip.opacity(0.38)))
+        mouth.drawLayer { layer in
+            layer.fill(contour, with: .color(lip))
+            guard opening > 0 else { return }
+
+            let cavity = mouthContour(width: width - 1.6, centerY: centerY, bend: bend,
+                                      tilt: tilt, halfHeight: openingHeight * smoothProgress(opening / 0.16))
+            var interior = layer
+            interior.clip(to: contour)
+            interior.fill(cavity, with: .color(Color(hex: 0x3B2531).opacity(smoothProgress(opening / 0.20))))
+            guard pose.mouthTongue > 0 else { return }
+
+            interior.clip(to: cavity)
+            let tongueY = centerY + openingHeight * 0.36
+            let tongue = Path(ellipseIn: CGRect(x: -width * 0.57, y: tongueY,
+                                                width: width * 1.14, height: opening * 19))
+            interior.fill(tongue, with: .color(Color(hex: 0xFF93B0).opacity(pose.mouthTongue * opening)))
         }
-        mouth.stroke(contour, with: .color(lip),
-                     style: StrokeStyle(lineWidth: 3.2, lineCap: .round, lineJoin: .round))
     }
 
-    private func mouthContour(left: CGPoint, right: CGPoint, centerY: CGFloat, curve: CGFloat,
-                              opening: CGFloat, roundness: CGFloat) -> Path {
-        let width = right.x
-        guard opening > 0.01 else {
-            return Path { path in
-                path.move(to: left)
-                path.addCurve(to: right,
-                              control1: CGPoint(x: -width * 0.63, y: centerY + curve),
-                              control2: CGPoint(x: width * 0.63, y: centerY + curve))
-            }
+    private func mouthContour(width: CGFloat, centerY: CGFloat, bend: CGFloat,
+                              tilt: CGFloat, halfHeight: CGFloat) -> Path {
+        // Keep a single contour from the closed smile to the open mouth.
+        let flatten = 0.48 * (1 - smoothProgress(halfHeight / 11))
+        func point(at angle: CGFloat) -> (position: CGPoint, tangent: CGVector) {
+            let horizontal = sin(angle)
+            let vertical = cos(angle)
+            let x = horizontal * (1 + flatten * vertical * vertical)
+            let dx = vertical * (1 + flatten * (1 - 3 * horizontal * horizontal))
+            let verticalRate = tilt - 2 * bend * x
+            let slope = verticalRate / width
+            let normalScale = 1 / hypot(1, slope)
+            let normal = CGVector(dx: -slope * normalScale, dy: normalScale)
+            let normalRate = (2 * bend * dx / width) * normalScale * normalScale * normalScale
+            let offset = halfHeight * vertical
+            let offsetRate = -halfHeight * horizontal
+            return (
+                CGPoint(x: width * x + offset * normal.dx,
+                        y: centerY + x * (tilt - bend * x) + offset * normal.dy),
+                CGVector(dx: width * dx + offsetRate * normal.dx + offset * normalRate,
+                         dy: dx * verticalRate + offsetRate * normal.dy + offset * slope * normalRate)
+            )
         }
 
-        let upperCenter = centerY + curve * 0.75 - opening * (5 + 10 * roundness)
-        let lowerCenter = centerY + curve * 0.75 + opening * 17
-        let middle = (upperCenter + lowerCenter) / 2
-        let sideRange = (lowerCenter - upperCenter) * 0.27
-        let smileLift = curve / 13 * sideRange * (1 - roundness)
-        let leftSide = CGPoint(x: left.x, y: middle + min(sideRange, max(-sideRange, left.y - centerY - smileLift)))
-        let rightSide = CGPoint(x: right.x, y: middle + min(sideRange, max(-sideRange, right.y - centerY - smileLift)))
-        let top = CGPoint(x: 0, y: upperCenter)
-        let bottom = CGPoint(x: 0, y: lowerCenter)
-        let horizontalHandle = width * 0.55
-
+        let sections = 12
+        let step = 2 * CGFloat.pi / CGFloat(sections)
+        let handle = step / 3
         return Path { path in
-            path.move(to: top)
-            path.addCurve(to: rightSide,
-                          control1: CGPoint(x: horizontalHandle, y: upperCenter),
-                          control2: CGPoint(x: right.x, y: rightSide.y - (rightSide.y - upperCenter) * 0.55))
-            path.addCurve(to: bottom,
-                          control1: CGPoint(x: right.x, y: rightSide.y + (lowerCenter - rightSide.y) * 0.55),
-                          control2: CGPoint(x: horizontalHandle, y: lowerCenter))
-            path.addCurve(to: leftSide,
-                          control1: CGPoint(x: -horizontalHandle, y: lowerCenter),
-                          control2: CGPoint(x: left.x, y: leftSide.y + (lowerCenter - leftSide.y) * 0.55))
-            path.addCurve(to: top,
-                          control1: CGPoint(x: left.x, y: leftSide.y - (leftSide.y - upperCenter) * 0.55),
-                          control2: CGPoint(x: -horizontalHandle, y: upperCenter))
+            let start = point(at: 0)
+            var previous = start
+            path.move(to: start.position)
+            for index in 1...sections {
+                let next = index == sections ? start : point(at: CGFloat(index) * step)
+                path.addCurve(to: next.position,
+                              control1: CGPoint(x: previous.position.x + previous.tangent.dx * handle,
+                                                y: previous.position.y + previous.tangent.dy * handle),
+                              control2: CGPoint(x: next.position.x - next.tangent.dx * handle,
+                                                y: next.position.y - next.tangent.dy * handle))
+                previous = next
+            }
             path.closeSubpath()
         }
     }
@@ -1015,6 +1037,12 @@ private enum PetActionGeometry {
         CGPoint(x: 150 + 16 * (1 - reach), y: 66 - 46 * reach)
     }
 
+    static func thoughtPulse(at time: TimeInterval, index: Int, motionEnabled: Bool) -> Double {
+        guard motionEnabled else { return 0.40 }
+        let phase = (time * 4 - Double(index) + 3).truncatingRemainder(dividingBy: 3)
+        return smooth(1 - abs(phase - 0.64) / 0.64)
+    }
+
     static func handHeart(reach: CGFloat, lift: Double) -> CGPoint {
         CGPoint(x: 0, y: 58 + (1 - reach) * 46 - lift * 49)
     }
@@ -1033,12 +1061,31 @@ private enum PetActionGeometry {
         CGPoint(x: 23 + 120 * progress, y: 43 - 108 * progress)
     }
 
+    static func kissVisibility(at progress: Double, motionEnabled: Bool) -> Double {
+        motionEnabled ? particleVisibility(at: progress, fadeIn: 0.12, fadeOut: 0.35) : 0.78
+    }
+
     static func bubbleProgress(at time: TimeInterval) -> Double {
         min(1, max(0, (time - 0.34) / 1.35))
     }
 
     static func bubblePosition(progress: Double) -> CGPoint {
-        CGPoint(x: 31 + 127 * progress, y: 43 - 98 * progress)
+        // Bubbles drift around the outside of the eye before rising.
+        CGPoint(x: 31 + 127 * (1 - pow(1 - progress, 3)),
+                y: 43 + 26 * sin(progress * .pi) - 98 * progress * progress * progress)
+    }
+
+    static func bubbleVisibility(at progress: Double) -> Double {
+        particleVisibility(at: progress, fadeIn: 0.15, fadeOut: 0.20)
+    }
+
+    static func particleVisibility(at progress: Double, fadeIn: Double, fadeOut: Double) -> Double {
+        smooth(progress / fadeIn) * smooth((1 - progress) / fadeOut)
+    }
+
+    private static func smooth(_ value: Double) -> Double {
+        let t = min(1, max(0, value))
+        return t * t * (3 - 2 * t)
     }
 }
 
@@ -1401,14 +1448,11 @@ struct PetScreenGlow: View {
             ], lineWidth: 1.8, haloWidth: 18, blur: 14)
         case .thinking:
             // Three stepping dots follow the thought bubbles across the top edge.
-            let phase = time * 4
-            let active = Int(phase) % 3
-            let progress = phase - phase.rounded(.down)
             let dots = (0..<3).map { index in
                 let step = Double(index)
-                let lit = active == index ? 0.46 + 0.34 * sin(progress * .pi) : 0.20
+                let pulse = PetActionGeometry.thoughtPulse(at: time, index: index, motionEnabled: motionEnabled)
                 return spot(0xB9A4FF, UnitPoint(x: 0.44 + step * 0.21, y: 0),
-                            accent(.thought) * (motionEnabled ? lit : 0.46), spread: 0.13,
+                            accent(.thought) * (0.20 + 0.60 * pulse), spread: 0.13,
                             anchor: CGPoint(x: 126 + 18 * step, y: -48 - 7 * step),
                             highlight: 0xE9DFFF)
             }
@@ -1430,7 +1474,7 @@ struct PetScreenGlow: View {
             let trail = (0..<3).map { index in
                 let step = Double(index)
                 let travel = PetActionGeometry.kissProgress(at: time - step * 0.13)
-                let launch = motionEnabled ? smooth(travel / 0.12) * (1 - smooth((travel - 0.65) / 0.35)) : 0.78
+                let launch = PetActionGeometry.kissVisibility(at: travel, motionEnabled: motionEnabled)
                 let edge = UnitPoint(x: 0.55 + 0.45 * travel, y: 1 - 0.94 * travel)
                 return spot(0xFF609E, edge, accent(.kiss) * launch * (0.88 - 0.17 * step),
                             spread: 0.30 - 0.04 * step, anchor: PetActionGeometry.kissPosition(progress: travel),
@@ -1507,7 +1551,7 @@ struct PetScreenGlow: View {
             let bubbles = (0..<4).map { index in
                 let step = Double(index)
                 let travel = PetActionGeometry.bubbleProgress(at: time - step * 0.22)
-                let visible = smooth(travel / 0.15) * (1 - smooth((travel - 0.80) / 0.20))
+                let visible = PetActionGeometry.bubbleVisibility(at: travel)
                 let edge = UnitPoint(x: 0.80 + 0.20 * smooth(travel * 2), y: 0.97 - 0.83 * travel)
                 let color = index.isMultiple(of: 2) ? 0x79DDFF : 0xA99EFF
                 return spot(color, edge, accent(.bubbles) * visible * (0.77 - step * 0.10),

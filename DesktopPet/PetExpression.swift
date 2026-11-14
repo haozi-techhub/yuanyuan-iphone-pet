@@ -211,8 +211,8 @@ enum PetExpression: String, CaseIterable, Codable, Identifiable {
         case .affectionate:
             PetPose(left: EyePose(), right: EyePose(), cheeks: 0.8, hearts: 1)
         case .sleepy:
-            PetPose(left: EyePose(width: 0.98, height: 0.11, curve: 36),
-                    right: EyePose(width: 0.98, height: 0.11, curve: 36),
+            PetPose(left: EyePose(width: 0.98, height: 0.11, curve: 36, lidWeight: 10),
+                    right: EyePose(width: 0.98, height: 0.11, curve: 36, lidWeight: 10),
                     brightness: 0.61, lookY: 8, sleep: 1)
         case .dizzy:
             PetPose(left: EyePose(), right: EyePose(), spirals: 1)
@@ -225,17 +225,17 @@ enum PetExpression: String, CaseIterable, Codable, Identifiable {
                     brightness: 0.88, mouth: 0.62, mouthCurve: 0.58,
                     lookX: -13, lookY: 10, cheeks: 0.94)
         case .laughing:
-            PetPose(left: EyePose(width: 1.12, height: 0.19, curve: -99),
-                    right: EyePose(width: 1.12, height: 0.19, curve: -99),
+            PetPose(left: EyePose(width: 1.12, height: 0.19, curve: -99, lidWeight: 11.4),
+                    right: EyePose(width: 1.12, height: 0.19, curve: -99, lidWeight: 11.4),
                     mouth: 1, mouthCurve: 0.93, mouthOpen: 0.94, mouthTongue: 0.94, cheeks: 0.82, accent: .laugh)
         case .winking:
-            PetPose(left: EyePose(width: 1.03, height: 0.14, curve: -24),
+            PetPose(left: EyePose(width: 1.03, height: 0.14, curve: -24, lidWeight: 9.6),
                     right: EyePose(height: 0.91, lift: -5),
                     mouth: 0.88, mouthCurve: 0.8, cheeks: 0.56, accent: .wink)
         case .listening:
             PetPose(left: EyePose(width: 1.34, height: 1.12, lift: -7),
                     right: EyePose(width: 1.34, height: 1.12, lift: -7),
-                    lookY: -6)
+                    lookY: -6, accent: .listen)
         case .thinking:
             PetPose(left: EyePose(height: 0.61, lift: 2), right: EyePose(height: 0.86, lift: -8),
                     mouth: 0.55, mouthCurve: -0.23, lookX: 13, lookY: -10, accent: .thought)
@@ -247,16 +247,19 @@ enum PetExpression: String, CaseIterable, Codable, Identifiable {
             PetPose(left: EyePose(height: 0.84), right: EyePose(height: 1.04, lift: -5),
                     lookX: -72, lookY: 27, accent: .peek)
         case .yawning:
-            PetPose(left: EyePose(height: 0.17, curve: 85), right: EyePose(height: 0.17, curve: 85),
+            PetPose(left: EyePose(height: 0.17, curve: 85, lidWeight: 12),
+                    right: EyePose(height: 0.17, curve: 85, lidWeight: 12),
                     mouth: 1, mouthOpen: 1, mouthRound: 1, mouthTongue: 0.25, lookY: 1, accent: .yawn)
         case .kiss:
-            PetPose(left: EyePose(height: 0.20, curve: -75), right: EyePose(height: 0.20, curve: -75),
+            PetPose(left: EyePose(height: 0.20, curve: -75, lidWeight: 10.5),
+                    right: EyePose(height: 0.20, curve: -75, lidWeight: 10.5),
                     mouth: 0.83, mouthOpen: 0.43, mouthRound: 0.82, cheeks: 0.92, accent: .kiss)
         case .hungry:
             PetPose(left: EyePose(width: 0.91, height: 1.14), right: EyePose(width: 0.91, height: 1.14),
                     mouth: 0.85, mouthOpen: 0.48, mouthRound: 0.86, lookX: 13, accent: .hungry)
         case .munching:
-            PetPose(left: EyePose(height: 0.28, curve: -75), right: EyePose(height: 0.28, curve: -75),
+            PetPose(left: EyePose(height: 0.28, curve: -75, lidWeight: 11.6),
+                    right: EyePose(height: 0.28, curve: -75, lidWeight: 11.6),
                     mouth: 0.9, mouthCurve: 0.58, mouthOpen: 0.44, mouthTongue: 0.46, cheeks: 0.64, accent: .crumbs)
         case .bubbles:
             PetPose(left: EyePose(height: 0.78), right: EyePose(height: 0.88, lift: -3),
@@ -266,19 +269,19 @@ enum PetExpression: String, CaseIterable, Codable, Identifiable {
                     right: EyePose(width: 0.94, height: 0.24, tilt: 0.09),
                     brightness: 0.82, mouth: 0.8, mouthCurve: -0.54, accent: .frost)
         case .dancing:
-            PetPose(left: EyePose(height: 0.24, curve: -80), right: EyePose(height: 0.62, lift: -7),
+            PetPose(left: EyePose(height: 0.24, curve: -80, lidWeight: 10.5), right: EyePose(height: 0.62, lift: -7),
                     mouth: 0.86, mouthCurve: 0.84, cheeks: 0.38, accent: .dance)
         case .handHeart:
-            PetPose(left: EyePose(height: 0.22, curve: -80, lift: -12),
-                    right: EyePose(height: 0.22, curve: -80, lift: -12),
+            PetPose(left: EyePose(height: 0.22, curve: -80, lift: -12, lidWeight: 11),
+                    right: EyePose(height: 0.22, curve: -80, lift: -12, lidWeight: 11),
                     cheeks: 0.70, accent: .handHeart)
         case .thumbsUp:
-            PetPose(left: EyePose(height: 0.25, curve: -82, lift: -10),
-                    right: EyePose(height: 0.30, curve: -76, lift: -10),
+            PetPose(left: EyePose(height: 0.25, curve: -82, lift: -10, lidWeight: 11),
+                    right: EyePose(height: 0.30, curve: -76, lift: -10, lidWeight: 11),
                     mouth: 0.85, mouthCurve: 0.9, cheeks: 0.36, accent: .thumbsUp)
         case .maracas:
-            PetPose(left: EyePose(height: 0.29, curve: -75, lift: -12),
-                    right: EyePose(height: 0.29, curve: -75, lift: -12),
+            PetPose(left: EyePose(height: 0.29, curve: -75, lift: -12, lidWeight: 11),
+                    right: EyePose(height: 0.29, curve: -75, lift: -12, lidWeight: 11),
                     mouth: 0.75, mouthCurve: 0.71, mouthOpen: 0.55, mouthTongue: 0.35, cheeks: 0.48, accent: .maracas)
         case .charging:
             PetPose(left: EyePose(height: 0.73, lift: -18),
@@ -287,8 +290,8 @@ enum PetExpression: String, CaseIterable, Codable, Identifiable {
         case .charged:
             PetPose(left: EyePose(), right: EyePose(), accent: .power)
         case .musical:
-            PetPose(left: EyePose(height: 0.22, curve: -80),
-                    right: EyePose(height: 0.22, curve: -80),
+            PetPose(left: EyePose(height: 0.22, curve: -80, lidWeight: 11),
+                    right: EyePose(height: 0.22, curve: -80, lidWeight: 11),
                     mouth: 0.74, mouthCurve: 0.52, mouthOpen: 0.48, mouthRound: 0.25, cheeks: 0.40, notes: 1)
         }
     }
@@ -316,7 +319,7 @@ struct EyePose {
 
 enum PetAccent: Equatable {
     case none, laugh, wink, thought, question, peek, yawn, kiss, hungry, crumbs, bubbles, frost, dance, charging, power, handHeart, thumbsUp, maracas
-    case marchGuitar
+    case listen, marchGuitar
 }
 
 struct PetPose {
