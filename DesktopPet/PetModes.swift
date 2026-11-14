@@ -8,7 +8,7 @@ enum PetMode: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .normal: "普通"
+        case .normal: "自动表情"
         case .companion: "陪伴"
         case .battery: "电量宠物"
         case .nightLight: "夜灯"

@@ -11,6 +11,7 @@ struct PetFace: View {
     var drawingSize: CGSize? = nil
     var showsBubbleDecoration = true
     var centerOffset: CGSize = .zero
+    var tapBurstAge: TimeInterval? = nil
 
     var body: some View {
         Canvas { context, size in
@@ -49,14 +50,59 @@ struct PetFace: View {
             }
             if pose.confetti > 0 { drawCelebration(in: face) }
             if pose.glasses > 0 { drawGlasses(in: face) }
-            if mouthEnabled && pose.mouth > 0 { drawMouth(in: face) }
+            if (mouthEnabled || tapBurstAge != nil) && pose.mouth > 0 { drawMouth(in: face) }
             drawHandsAndProps(in: face)
             if pose.tears > 0 {
                 drawTear(in: face, x: -76, delay: 0)
                 drawTear(in: face, x: 76, delay: 0.48)
             }
+            if let tapBurstAge { drawAngerBurst(in: face, age: tapBurstAge) }
         }
         .accessibilityHidden(true)
+    }
+
+    private func drawAngerBurst(in context: GraphicsContext, age: TimeInterval) {
+        let sinceRelease = age - PetPlayback.tapBurstRelease
+        if sinceRelease < 0 {
+            let puff = min(1, age / 0.3)
+            var cheeks = context
+            cheeks.opacity = puff * 0.72
+            for side: CGFloat in [-1, 1] {
+                let oval = CGRect(x: side * 111 - 21, y: 35, width: 42, height: 26)
+                cheeks.fill(Path(ellipseIn: oval), with: .color(Color(hex: 0xFF564B)))
+                cheeks.stroke(Path(ellipseIn: oval.insetBy(dx: 2, dy: 2)),
+                              with: .color(Color(hex: 0xFFA080)), lineWidth: 2)
+            }
+            return
+        }
+
+        let progress = CGFloat(min(1, sinceRelease / 0.72))
+        guard progress < 1 else { return }
+        let expansion = motionEnabled ? 1 - pow(1 - progress, 3) : 0.65
+        let visibility = (1 - progress) * min(1, sinceRelease / 0.06)
+        let radius = 68 + 83 * expansion
+        var sparks = context
+        sparks.opacity = Double(visibility)
+        for index in 0..<12 {
+            let angle = CGFloat(index) * .pi / 6
+            let x = cos(angle)
+            let y = sin(angle) * 0.65
+            let length: CGFloat = index.isMultiple(of: 2) ? 25 : 13
+            let ray = Path { path in
+                path.move(to: CGPoint(x: x * radius, y: y * radius))
+                path.addLine(to: CGPoint(x: x * (radius + length), y: y * (radius + length)))
+            }
+            sparks.stroke(ray, with: .color(index.isMultiple(of: 2) ? .orange : .red),
+                          style: StrokeStyle(lineWidth: 4, lineCap: .round))
+        }
+
+        var steam = context
+        steam.opacity = Double(progress * (1 - progress)) * 2
+        for side: CGFloat in [-1, 1] {
+            let center = CGPoint(x: side * (96 + 42 * expansion), y: -14 - 27 * expansion)
+            let puff = Path(ellipseIn: CGRect(x: center.x - 18, y: center.y - 10, width: 36, height: 20))
+            steam.fill(puff, with: .color(Color(hex: 0xFFE0C2)))
+        }
     }
 
     private func drawEye(in context: GraphicsContext, x: CGFloat, eye: EyePose, color: Color, opacity: CGFloat) {
@@ -81,63 +127,8 @@ struct PetFace: View {
 
     private func drawEyelid(in context: GraphicsContext, openness: CGFloat, bend: CGFloat,
                            widthScale: CGFloat, strokeWeight: CGFloat, color: Color) {
-        let curvedLid = min(1, max(0, (abs(bend) - 0.35) / 0.45))
-        let openLimit = 0.43 + curvedLid * 0.08
-        let closedLimit = 0.19 + curvedLid * 0.13
-        let closed = smoothProgress((openLimit - openness) / (openLimit - closedLimit))
-        // Fill out every curved lid as it closes, including curves set by animation keyframes.
-        let fullness = smoothProgress(abs(bend) / 0.30)
-        let radius = strokeWeight / 2
-        let closedThickness = radius * 1.08 + 3 * fullness
-        let thickness = (1 - closed) * 53 * openness + closed * closedThickness
-        let openWidth = 35 * widthScale
-        let closedWidth = (22 + 13 * abs(bend)) * widthScale + radius * 0.85
-        let halfWidth = openWidth + (closedWidth - openWidth) * closed
-        let arc = 30 * bend * closed * closed * closed
-        let centerY = 6 * closed * (1 - abs(bend)) + arc * 0.75
-        let cornerRoundness = 0.48 * closed
-        let taper = (0.09 - 0.19 * fullness) * closed
-
-        // Bend one continuous oval. Spreading the turn across its sides lets the lids
-        // taper into the tips without a separate end cap.
-        func outlinePoint(at angle: CGFloat) -> (point: CGPoint, tangent: CGVector) {
-            let horizontal = sin(angle)
-            let vertical = cos(angle)
-            let x = horizontal * (1 + cornerRoundness * vertical * vertical)
-            let dx = vertical * (1 + cornerRoundness * (1 - 3 * horizontal * horizontal))
-            let taperScale = 1 - taper * horizontal * horizontal
-            let offset = thickness * vertical * taperScale
-            let offsetRate = -thickness * horizontal * (taperScale + 2 * taper * vertical * vertical)
-            let normalX = 2 * arc * x / halfWidth
-            let normalScale = 1 / hypot(1, normalX)
-            let normal = CGVector(dx: normalX * normalScale, dy: normalScale)
-            let normalRate = (2 * arc * dx / halfWidth) * normalScale * normalScale * normalScale
-            return (
-                CGPoint(x: halfWidth * x + offset * normal.dx,
-                        y: centerY - arc * x * x + offset * normal.dy),
-                CGVector(dx: halfWidth * dx + offsetRate * normal.dx + offset * normalRate,
-                         dy: -2 * arc * x * dx + offsetRate * normal.dy - offset * normalX * normalRate)
-            )
-        }
-
-        let sections = 16
-        let step = 2 * CGFloat.pi / CGFloat(sections)
-        let handle = step / 3
-        let outline = Path { path in
-            let start = outlinePoint(at: 0)
-            var previous = start
-            path.move(to: start.point)
-            for index in 1...sections {
-                let next = index == sections ? start : outlinePoint(at: CGFloat(index) * step)
-                path.addCurve(to: next.point,
-                              control1: CGPoint(x: previous.point.x + previous.tangent.dx * handle,
-                                                y: previous.point.y + previous.tangent.dy * handle),
-                              control2: CGPoint(x: next.point.x - next.tangent.dx * handle,
-                                                y: next.point.y - next.tangent.dy * handle))
-                previous = next
-            }
-            path.closeSubpath()
-        }
+        let outline = PetEyelid.outline(openness: openness, bend: bend,
+                                        widthScale: widthScale, strokeWeight: strokeWeight)
         context.fill(outline, with: .color(color))
     }
 
@@ -1104,6 +1095,7 @@ struct PetScreenGlow: View {
     var faceOffset: CGSize = .zero
     var faceScale: CGFloat = 1
     var pose = PetExpression.idle.pose
+    var showsHalo = true
     private let edgeInset: CGFloat = 2
 
     private struct EdgeLightSpot {
@@ -1145,8 +1137,10 @@ struct PetScreenGlow: View {
                                 center: .bottom, radius: max(size.width, size.height) * 0.68, tail: 0.16)
             shape.stroke(warm, lineWidth: 2.4)
                 .background {
-                    shape.stroke(warm, lineWidth: 22)
-                        .blur(radius: 15)
+                    if showsHalo {
+                        shape.stroke(warm, lineWidth: 22)
+                            .blur(radius: 15)
+                    }
                 }
                 .padding(edgeInset)
         } else {
@@ -1163,14 +1157,19 @@ struct PetScreenGlow: View {
                                 radius: min(size.width, size.height) * spot.spread)
             }
 
-            let ring = Color(hex: 0x92FFB6).opacity(frame.ringOpacity * envelope)
-            strokes(shape, gradients: gradients, ring: ring, width: frame.lineWidth)
-                .background {
-                    strokes(shape, gradients: gradients, ring: ring, width: frame.haloWidth)
-                        .compositingGroup()
-                        .blur(radius: frame.blur)
-                }
-                .padding(edgeInset)
+            let ringOpacity = frame.ringOpacity * envelope
+            if !gradients.isEmpty || ringOpacity > 0.004 {
+                let ring = Color(hex: 0x92FFB6).opacity(ringOpacity)
+                strokes(shape, gradients: gradients, ring: ring, width: frame.lineWidth)
+                    .background {
+                        if showsHalo {
+                            strokes(shape, gradients: gradients, ring: ring, width: frame.haloWidth)
+                                .compositingGroup()
+                                .blur(radius: frame.blur)
+                        }
+                    }
+                    .padding(edgeInset)
+            }
         }
     }
 

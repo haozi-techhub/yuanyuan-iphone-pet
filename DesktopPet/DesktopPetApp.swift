@@ -16,19 +16,19 @@ struct DesktopPetApp: App {
 struct PetScreen: View {
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityVoiceOverEnabled) private var voiceOverEnabled
     @Environment(\.layoutDirection) private var layoutDirection
-    @AppStorage(PetScreenOrientation.storageKey) private var screenOrientation: PetScreenOrientation = .automatic
-    @AppStorage("pet.showSettingsButton") private var showSettingsButton = false
-    @AppStorage("pet.showVoiceButton") private var showVoiceButton = false
-    @AppStorage("pet.showPetCaption") private var showPetCaption = true
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @State private var systemPresence = PetSystemPresence.shared
+    @AppStorage(PetSystemPresence.bannerPreference) private var messageBanners = true
+    @AppStorage(PetSystemPresence.companionPreference) private var liveCompanion = true
     @AppStorage("pet.proactiveGreetings") private var proactiveGreetings = true
     @AppStorage("pet.lastGreetingAt") private var lastGreetingAt: Double = 0
     @AppStorage("pet.keepAwake") private var keepAwake = false
+    @AppStorage("pet.lightweightDisplay") private var lightweightDisplay = false
     @AppStorage("pet.showMouth") private var showMouth = false
     @AppStorage("pet.mode") private var mode: PetMode = .normal
     @AppStorage("pet.nightLightMinutes") private var nightLightMinutes = 0
-    @AppStorage("pet.eyeTracking") private var eyeTracking = false
-    @AppStorage("pet.handGestures") private var handGestures = false
     @AppStorage("pet.motion") private var motion = false
     @AppStorage("pet.soundReactions") private var sound = false
     @AppStorage("pet.expressionSounds") private var expressionSounds = false
@@ -38,8 +38,16 @@ struct PetScreen: View {
     @AppStorage("pet.personality") private var personality = "元气"
     @AppStorage("pet.customPersonality") private var customPersonality = ""
     @State private var director = PetDirector()
-    @State private var showControls = false
-    @AppStorage("pet.visionEnabled") private var visionEnabled = false
+    @State private var activePanel: HomePanel?
+    @State private var homeButtonsVisible = true
+    @State private var homeButtonsTimer = UUID()
+    @State private var touchingPet = false
+    @State private var lowPowerMode = ProcessInfo.processInfo.isLowPowerModeEnabled
+    @State private var thermalState = ProcessInfo.processInfo.thermalState
+    @AppStorage("pet.hasSeenControlsHint") private var hasSeenControlsHint = false
+    @State private var showControlsHint = false
+    @State private var visionEnabled = false
+    @State private var showCameraPermissionAlert = false
     @State private var messageAlertID: UUID?
     @State private var activityPath: [ActivityPage] = []
     @State private var pendingExpression: PetExpression?
@@ -51,13 +59,22 @@ struct PetScreen: View {
     @State private var keyMessages: [KeychainStore.Account: String] = [:]
     @State private var checkingKey: KeychainStore.Account?
     @State private var keyCheckTask: Task<Void, Never>?
-    @GestureState private var faceDragActive = false
-    @GestureState private var micHeld = false
-    @State private var micStarted = false
+    @State private var expressionCategory = 0
+    @State private var gestureOffset = CGSize.zero
+    @AppStorage("pet.triedExpressionSwipe") private var triedExpressionSwipe = false
+
+    private enum HomePanel: String, Identifiable {
+        case play, settings
+
+        var id: Self { self }
+    }
 
     private enum ActivityPage: Hashable {
-        case focus, game
+        case focus, game, expressionPrograms, gestures, morePlay
+        case petProfile, audio, services, systemPresence
     }
+
+    private var showControls: Bool { activePanel != nil }
 
     private var displayName: String {
         let name = petName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -66,7 +83,7 @@ struct PetScreen: View {
 
     private var settings: PetDirector.Settings {
         PetDirector.Settings(mode: mode, nightLightMinutes: nightLightMinutes, keepAwake: keepAwake,
-                             eyeTracking: eyeTracking, handGestures: handGestures, visionEnabled: visionEnabled, motion: motion, sound: sound,
+                             visionEnabled: visionEnabled, motion: motion, sound: sound,
                              foreground: scenePhase == .active, background: scenePhase == .background,
                              controlsOpen: showControls, expressionSoundsEnabled: expressionSounds,
                              focusing: director.focusTimer.isFocusing)
@@ -90,7 +107,23 @@ struct PetScreen: View {
                      model: model, name: displayName, personality: selectedPersonality)
     }
 
+    private var showsHomeButtons: Bool { homeButtonsVisible || voiceOverEnabled }
+
     private var expressionShowActive: Bool { director.expressionShow != nil }
+
+    private var usesLightweightDisplay: Bool {
+        lightweightDisplay || lowPowerMode || thermalState == .serious || thermalState == .critical
+    }
+
+    private var faceFrameInterval: TimeInterval {
+        let interactive = touchingPet || visionEnabled || motion || director.playSession != nil
+        let animated = director.isAnimatingExpression || expressionShowActive || director.isPlayingMarch
+            || director.voice.phase == .speaking
+        if interactive || animated {
+            return usesLightweightDisplay || reduceMotion ? 1.0 / 30 : 1.0 / 60
+        }
+        return usesLightweightDisplay || reduceMotion ? 1.0 / 12 : 1.0 / 30
+    }
 
     var body: some View {
         GeometryReader { geometry in
@@ -104,7 +137,7 @@ struct PetScreen: View {
                 Color(white: 0.035)
                     .ignoresSafeArea()
 
-                TimelineView(.animation(minimumInterval: 1.0 / 30, paused: scenePhase != .active || showControls)) { _ in
+                TimelineView(.animation(minimumInterval: faceFrameInterval, paused: scenePhase != .active || showControls)) { _ in
                     let now = director.now
                     let expression = director.expression(at: now)
                     let variant = director.expressionVariant(at: now)
@@ -113,10 +146,8 @@ struct PetScreen: View {
                     let isActing = isPerforming || expressionShowActive
                     let travel = director.travel(at: now, motionEnabled: !reduceMotion)
                     let pose = director.pose(at: now, motionEnabled: !reduceMotion)
-                    let elapsed = director.elapsed(at: now)
-                    let duration = director.expressionDuration(at: now)
                     let art = faceDrawingSize(in: geometry.size, portrait: portrait,
-                                              emphasis: expressionEmphasis(expression, elapsed: elapsed, duration: duration))
+                                              emphasis: director.faceScale(at: now, motionEnabled: !reduceMotion))
                     let centerOffset = faceOffset(travel, in: geometry.size, art: art, portrait: portrait)
                     let glowOffset = CGSize(width: safeAreaOffset.width + centerOffset.width,
                                             height: safeAreaOffset.height + centerOffset.height)
@@ -130,7 +161,8 @@ struct PetScreen: View {
                                 eyeTint: expressionShowActive ? nil : director.modes.eyeTint,
                                 batteryLevel: isActing || isPreviewing ? nil : director.modes.batteryLevel,
                                 drawingSize: art, showsBubbleDecoration: director.playSession?.activity != .bubbles,
-                                centerOffset: centerOffset)
+                                centerOffset: centerOffset, tapBurstAge: director.tapBurstAge(at: now))
+                            .offset(gestureOffset)
                             .allowsHitTesting(false)
 
                         interactionArea(expression: expression, isPreviewing: isPreviewing, isActing: isActing,
@@ -147,7 +179,7 @@ struct PetScreen: View {
                 }
 
                 VStack {
-                    topControls(portrait: portrait)
+                    topControls
                     Spacer()
                 }
                 .padding(.horizontal, 20)
@@ -161,34 +193,65 @@ struct PetScreen: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                 }
 
+                if showsHomeButtons && !showControls && !expressionShowActive && !director.isPlayingMarch
+                    && director.playSession == nil && !canStopVoice {
+                    cornerButton("设置", symbol: "gearshape") { activePanel = .settings }
+                        .padding(.trailing, 20)
+                        .padding(.top, 8)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                }
+
                 if director.playSession != nil {
-                    headerButton("退出互动", symbol: "xmark", action: director.endPlay)
+                    cornerButton("退出互动", symbol: "xmark", action: director.endPlay)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
                         .padding(16)
                 }
 
                 if director.isPlayingMarch {
-                    headerButton("停止唱歌", symbol: "stop.fill", action: director.stopMarch)
+                    cornerButton("停止唱歌", symbol: "stop.fill", action: director.stopMarch)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
                         .padding(16)
-                } else if voiceAvailable && !showControls {
-                    conversationControls
-                        .padding(.trailing, 20)
-                        .padding(.bottom, 14)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+                } else if !expressionShowActive && !showControls {
+                    HStack(spacing: 10) {
+                        if director.playSession == nil {
+                            if mode == .nightLight {
+                                cornerButton("回到陪伴", symbol: "moon.zzz") { mode = .companion }
+                            } else if voiceAvailable {
+                                conversationControls
+                            }
+                        }
+                        if voiceAvailable && (visionEnabled || (showsHomeButtons && director.playSession == nil && !director.focusTimer.isFocusing)) {
+                            visionControl
+                        }
+                        if showsHomeButtons && director.playSession == nil && !canStopVoice {
+                            cornerButton("玩法", symbol: "sparkles") { activePanel = .play }
+                        }
+                    }
+                    .padding(.trailing, 20)
+                    .padding(.bottom, 14)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
                 }
+
             }
             .onChange(of: geometry.size, initial: true) { _, _ in director.updateOrientation() }
         }
         .accessibilityHidden(showControls)
-        .background { PetOrientationPreference(orientation: screenOrientation) }
-        .sheet(isPresented: $showControls, onDismiss: playPendingSelection) {
-            controls
+        .sheet(item: $activePanel, onDismiss: playPendingSelection) { panel in
+            controls(panel)
                 .preferredColorScheme(.dark)
                 .presentationDragIndicator(.visible)
+                .presentationDetents([.large])
         }
         .onOpenURL { url in
-            guard url.absoluteString == "yuanyuan-pet://message-received" else { return }
+            if url == PetSystemPresence.legacyMessageURL {
+                Task { await previewMessageReminder() }
+            } else if url == PetLiveActivityAttributes.openURL {
+                activePanel = nil
+                Task { await systemPresence.openCompanion() }
+            }
+        }
+        .onChange(of: systemPresence.messageEvent, initial: true) { _, event in
+            guard let event, abs(event.timeIntervalSinceNow) < 8 else { return }
             messageAlertID = UUID()
         }
         .task(id: messageAlertID) {
@@ -201,8 +264,56 @@ struct PetScreen: View {
             messageAlertID = nil
         }
         .statusBarHidden()
-        .onChange(of: settings, initial: true) { _, value in director.configure(value) }
-        .onChange(of: director.senses.cameraStatus) { _, _ in director.visionCameraStatusChanged() }
+        .onChange(of: settings, initial: true) { _, value in
+            director.configure(value)
+            if !director.canBrowseExpressions { settleGesture() }
+        }
+        .onChange(of: director.senses.cameraStatus) { _, status in
+            director.visionCameraStatusChanged()
+            if visionEnabled && status == .denied {
+                visionEnabled = false
+                showCameraPermissionAlert = true
+            }
+        }
+        .onChange(of: scenePhase, initial: true) { _, phase in
+            if phase == .background {
+                visionEnabled = false
+                Task { await LocalTTSClient.releaseCachedVoice() }
+            }
+            if phase == .active {
+                lowPowerMode = ProcessInfo.processInfo.isLowPowerModeEnabled
+                thermalState = ProcessInfo.processInfo.thermalState
+                revealHomeButtons()
+                Task {
+                    await systemPresence.syncCompanion(enabled: liveCompanion, name: displayName)
+                    await systemPresence.requestBannerPermissionIfNeeded()
+                }
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .NSProcessInfoPowerStateDidChange)) { _ in
+            lowPowerMode = ProcessInfo.processInfo.isLowPowerModeEnabled
+        }
+        .onReceive(NotificationCenter.default.publisher(for: ProcessInfo.thermalStateDidChangeNotification)) { _ in
+            thermalState = ProcessInfo.processInfo.thermalState
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in
+            Task { await LocalTTSClient.releaseCachedVoice() }
+        }
+        .onChange(of: mode) { _, value in
+            if value == .nightLight { visionEnabled = false }
+        }
+        .onChange(of: director.focusTimer.isFocusing) { _, focusing in
+            if focusing { visionEnabled = false }
+        }
+        .alert("隔空互动需要相机", isPresented: $showCameraPermissionAlert) {
+            Button("打开设置") {
+                guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+                UIApplication.shared.open(url)
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("允许圆圆使用相机后，回来点眼睛即可开始。画面只在这台 iPhone 上处理。")
+        }
         .onChange(of: wakeSettings, initial: true) { _, value in
             director.voice.configureWake(enabled: value.enabled, model: value.model,
                                          name: value.name, personality: value.personality)
@@ -211,17 +322,25 @@ struct PetScreen: View {
         .onChange(of: director.voice.isCapturingSpeech) { _, capturing in
             if !capturing && director.voice.phase == .listening { director.voicePhaseChanged() }
         }
-        .onChange(of: micHeld) { _, held in if !held { endMicHold() } }
         .onChange(of: showControls) { _, showing in
             if !showing {
+                revealHomeButtons()
                 activityPath.removeAll()
                 director.voice.stopPreview()
-                keyCheckTask?.cancel()
-                keyCheckTask = nil
-                checkingKey = nil
-                keyInputs.removeAll()
-                keyMessages.removeAll()
+                clearKeyEditing()
             }
+        }
+        .task(id: homeButtonsTimer) {
+            guard homeButtonsVisible, !showControls, !touchingPet, scenePhase == .active, !voiceOverEnabled else { return }
+            do { try await Task.sleep(for: .seconds(5)) } catch { return }
+            guard !showControls, !touchingPet, scenePhase == .active, !voiceOverEnabled else { return }
+            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) { homeButtonsVisible = false }
+            guard !hasSeenControlsHint, mode != .nightLight, !expressionShowActive,
+                  director.playSession == nil, !director.isPlayingMarch, !canStopVoice, !visionEnabled else { return }
+            hasSeenControlsHint = true
+            showControlsHint = true
+            do { try await Task.sleep(for: .seconds(2.5)) } catch { return }
+            showControlsHint = false
         }
         .task {
             if petName == "桌宠" { petName = PetVoice.defaultPetName }
@@ -283,8 +402,10 @@ struct PetScreen: View {
     }
 
     private var showsConversation: Bool {
-        guard !showControls, voiceAvailable, !director.isPlayingMarch else { return false }
-        return director.visionHint != nil || messageAlertID != nil || director.voice.replyText != nil || director.voice.status != nil
+        guard !showControls else { return false }
+        if messageAlertID != nil { return true }
+        guard voiceAvailable, !director.isPlayingMarch else { return false }
+        return director.visionHint != nil || director.voice.replyText != nil || director.voice.status != nil
     }
 
     private var conversationBubble: some View {
@@ -292,7 +413,7 @@ struct PetScreen: View {
         return PetConversationBubble(
             name: displayName,
             transcript: voice.transcript,
-            message: voice.replyText ?? director.visionHint ?? (messageAlertID == nil ? nil : "你有一条新消息"),
+            message: messageAlertID == nil ? (voice.replyText ?? director.visionHint) : systemPresence.messageText,
             status: voice.status
         )
     }
@@ -308,7 +429,7 @@ struct PetScreen: View {
     }
 
     @ViewBuilder
-    private func topControls(portrait: Bool) -> some View {
+    private var topControls: some View {
         if let show = director.expressionShow {
             HStack(spacing: 10) {
                 VStack(alignment: .leading, spacing: 4) {
@@ -323,20 +444,11 @@ struct PetScreen: View {
                 }
                 Spacer()
                 focusStatus
-                headerButton("跳过当前表情", symbol: "forward.end.fill", action: director.skipExpressionShowStep)
-                headerButton("退出表情秀", symbol: "xmark", action: director.stopExpressionShow)
-                if showSettingsButton {
-                    headerButton("表情与设置", symbol: "slider.horizontal.3") { showControls = true }
-                }
+                cornerButton("跳过当前表情", symbol: "forward.end.fill", action: director.skipExpressionShowStep)
+                cornerButton("退出表情秀", symbol: "xmark", action: director.stopExpressionShow)
             }
         } else {
             HStack(spacing: 8) {
-                if portrait {
-                    Text(displayName)
-                        .font(.system(.title3, design: .rounded, weight: .semibold))
-                        .foregroundStyle(.white)
-                        .accessibilityAddTraits(.isHeader)
-                }
                 Spacer()
                 if let program = director.completedExpressionShow, director.focusTimer.statusText == nil {
                     Button {
@@ -352,10 +464,8 @@ struct PetScreen: View {
                     .accessibilityLabel("再播\(program.title)")
                 }
                 focusStatus
-                if showSettingsButton {
-                    headerButton("表情与设置", symbol: "slider.horizontal.3") { showControls = true }
-                }
             }
+            .padding(.trailing, showsHomeButtons && director.playSession == nil && !director.isPlayingMarch && !canStopVoice ? 92 : 0)
         }
     }
 
@@ -371,26 +481,6 @@ struct PetScreen: View {
                 .layoutPriority(1)
                 .allowsHitTesting(false)
         }
-    }
-
-    private func headerButton(_ title: String, symbol: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: symbol)
-                .font(.system(size: 17, weight: .semibold))
-                .frame(width: 44, height: 44)
-                .background(.ultraThinMaterial, in: Circle())
-                .overlay { Circle().strokeBorder(.white.opacity(0.16)) }
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(title)
-    }
-
-    private func expressionEmphasis(_ expression: PetExpression, elapsed: TimeInterval, duration: TimeInterval) -> CGFloat {
-        guard expression != .idle, expression != .sleepy, mode != .nightLight || expressionShowActive else { return 1 }
-        let strength: CGFloat = expression == .happy || expression == .laughing || expression == .surprised ? 0.25 : 0.17
-        guard !reduceMotion else { return 1 + strength }
-        let progress = CGFloat(min(1, max(0, min(elapsed / 0.24, (duration - elapsed) / 0.26))))
-        return 1 + strength * progress * progress * (3 - 2 * progress)
     }
 
     private func faceDrawingSize(in size: CGSize, portrait: Bool, emphasis: CGFloat) -> CGSize {
@@ -411,18 +501,23 @@ struct PetScreen: View {
         ZStack {
             if !expressionShowActive, let tint = director.modes.glowTint {
                 PetScreenGlow(expression: .idle, elapsed: 0, motionEnabled: false,
-                              tintOverride: tint, tintStrength: Double(director.brightness(motionEnabled: !reduceMotion)))
+                              tintOverride: tint, tintStrength: Double(pose.brightness),
+                              showsHalo: !usesLightweightDisplay)
             } else {
                 let layers = reduceMotion
                     ? [PetPlayback.GlowLayer(expression: expression, startedAt: now, opacity: 1, variant: variant)]
                     : director.glow(at: now)
                 ForEach(layers.indices, id: \.self) { index in
                     let layer = layers[index]
-                    PetScreenGlow(expression: layer.expression, elapsed: layer.exitElapsed ?? (now - layer.startedAt),
-                                  motionEnabled: !reduceMotion, variant: layer.variant, isBaseline: layer.isBaseline,
-                                  playbackDuration: layer.duration,
-                                  faceOffset: faceOffset, faceScale: faceScale, pose: layer.exitPose ?? pose)
-                        .opacity(layer.opacity * (layer.expression == .idle ? 0.22 : 0.62))
+                    let resting = layer.expression == .idle && layer.isBaseline
+                    if layer.opacity > 0.005 {
+                        PetScreenGlow(expression: layer.expression, elapsed: layer.exitElapsed ?? (now - layer.startedAt),
+                                      motionEnabled: !reduceMotion, variant: layer.variant, isBaseline: layer.isBaseline,
+                                      playbackDuration: layer.duration,
+                                      faceOffset: faceOffset, faceScale: faceScale, pose: layer.exitPose ?? pose,
+                                      showsHalo: !usesLightweightDisplay && !resting)
+                            .opacity(layer.opacity * (layer.expression == .idle ? 0.22 : 0.62))
+                    }
                 }
                 if portrait, !expressionShowActive, let level = director.modes.batteryLevel {
                     PetBatteryGlow(level: level)
@@ -438,7 +533,9 @@ struct PetScreen: View {
     private func captions(for expression: PetExpression, variant: PetExpressionVariant,
                           isPreviewing: Bool, isPerforming: Bool) -> some View {
         VStack(spacing: 4) {
-            if let status = caption(for: expression, variant: variant, isPreviewing: isPreviewing, isPerforming: isPerforming) {
+            if showControlsHint && !showsConversation {
+                Text("轻点屏幕显示按钮")
+            } else if let status = caption(for: expression, variant: variant, isPreviewing: isPreviewing, isPerforming: isPerforming) {
                 Text(status)
             }
             if let battery = director.modes.batteryCaption {
@@ -449,8 +546,8 @@ struct PetScreen: View {
         .foregroundStyle(Color(red: 0.81, green: 0.79, blue: 0.91))
         .multilineTextAlignment(.center)
         .frame(maxWidth: 420)
-        .padding(.horizontal, 72)
-        .padding(.bottom, 16)
+        .padding(.horizontal, 112)
+        .padding(.bottom, 26)
         .allowsHitTesting(false)
     }
 
@@ -461,7 +558,11 @@ struct PetScreen: View {
         }
         if expressionShowActive || isPerforming {
             if expression.depictsSystemState { return "表情演绎 · \(expression.rawValue)" }
-            return expressionShowActive || showPetCaption ? expression.rawValue : nil
+            return expression.rawValue
+        }
+        if director.tapBurstAge(at: director.now) != nil { return "圆圆气炸啦！" }
+        if director.isBrowsingExpression(at: director.now) {
+            return "表情 · \(expression.rawValue)"
         }
         if isPreviewing {
             let title = "预览 · \(expression.rawValue)"
@@ -472,14 +573,11 @@ struct PetScreen: View {
         if let status = director.notice ?? director.countdownText() ?? director.modes.caption {
             return status
         }
-        guard showPetCaption, !showsConversation else { return nil }
-        if expression == .idle, director.focusTimer.isFocusing { return nil }
-        if expression == .idle, director.voice.isWaitingForWake {
-            return "说「嘿，\(displayName)」唤醒"
-        }
-        if mode == .battery && (expression == .idle || expression == .charging || expression == .charged) { return nil }
-        if expression == .idle { return mode == .normal ? "轻点，换个表情" : "轻点，它会回应你" }
-        return expression.rawValue
+        guard !showsConversation, !director.focusTimer.isFocusing,
+              expression == .idle, mode == .normal || mode == .companion else { return nil }
+        if visionEnabled && director.senses.cameraStatus == .active { return "隔空互动中 · 试试挥手" }
+        if director.voice.isWaitingForWake { return "说「嘿，\(displayName)」也能聊聊" }
+        return triedExpressionSwipe ? "戳一戳 · 摸摸脸" : "戳一戳 · 双指滑换表情"
     }
 
     private var voiceAvailable: Bool { !expressionShowActive && mode != .nightLight && !director.senses.isFaceDown }
@@ -490,116 +588,121 @@ struct PetScreen: View {
 
     private var conversationControls: some View {
         HStack(spacing: 10) {
-            if showsConversation && director.voice.canRecord && director.visionHint == nil {
+            if showsHomeButtons && showsConversation && director.voice.canRecord && director.visionHint == nil {
                 if director.voice.replyText != nil {
-                    headerButton("重播回复", symbol: "speaker.wave.2") {
+                    cornerButton("重播回复", symbol: "speaker.wave.2") {
                         director.voice.replayReply()
                     }
                 }
-                headerButton("关闭对话气泡", symbol: "xmark") {
+                cornerButton("收起对话", symbol: "xmark") {
                     messageAlertID = nil
                     director.voice.dismissConversation()
                 }
             }
-            if showVoiceButton && (director.canUseVoice || micStarted) {
-                microphoneControl
+            if showsHomeButtons || canStopVoice {
+                cornerButton(canStopVoice ? "结束对话" : "聊聊", symbol: canStopVoice ? "xmark" : "mic.fill",
+                             highlighted: canStopVoice, action: toggleConversation)
+                    .accessibilityLabel(canStopVoice ? "结束对话" : "和\(displayName)聊聊")
+                    .disabled(!canStopVoice && !director.canUseVoice)
             }
-            if !director.focusTimer.isFocusing { visionControl }
-            Button(action: toggleConversation) {
-                Image(systemName: canStopVoice ? "xmark" : "mic.fill")
-                    .font(.system(size: 23, weight: .semibold))
-                    .frame(width: 60, height: 60)
-                    .background(canStopVoice ? AnyShapeStyle(Color.red.opacity(0.28)) : AnyShapeStyle(.ultraThinMaterial),
-                                in: Circle())
-                    .overlay { Circle().strokeBorder(.white.opacity(0.18), lineWidth: 1) }
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel(canStopVoice ? "结束对话" : "开始说话")
-            .disabled(!canStopVoice && !director.canUseVoice)
         }
     }
 
     private var visionControl: some View {
-        let active = visionEnabled && director.senses.cameraStatus == .active
-        let status = if !visionEnabled { "已关闭" } else {
-            switch director.senses.cameraStatus {
-            case .active: "前置相机已开启"
-            case .denied: "相机权限未开启"
-            case .unavailable: "相机暂不可用"
-            case .thermal: "设备过热，已暂停"
-            case .inactive: "前置相机已暂停"
-            case .starting: "前置相机正在开启"
+        let status = director.senses.cameraStatus
+        let active = visionEnabled && status == .active
+        let title = visionEnabled ? "关闭隔空" : "隔空互动"
+        let symbol: String
+        let state: String
+        if !visionEnabled {
+            symbol = "eye"
+            state = "已关闭"
+        } else {
+            switch status {
+            case .active:
+                symbol = "eye.fill"
+                state = "相机已开启"
+            case .starting:
+                symbol = "eye"
+                state = "正在开启相机"
+            case .unavailable:
+                symbol = "eye.slash"
+                state = "相机不可用"
+            default:
+                symbol = "eye.slash"
+                state = "相机已暂停"
             }
         }
+
         return Button {
+            revealHomeButtons()
             visionEnabled.toggle()
         } label: {
-            Image(systemName: active ? "eye.fill" : "eye")
-                .font(.system(size: 22, weight: .semibold))
-                .foregroundStyle(active ? Color.cyan : Color.white)
-                .frame(width: 60, height: 60)
-                .background(active ? AnyShapeStyle(Color.cyan.opacity(0.17)) : AnyShapeStyle(.ultraThinMaterial),
-                            in: Circle())
-                .overlay { Circle().strokeBorder(active ? .cyan.opacity(0.5) : .white.opacity(0.18)) }
+            HStack(spacing: 6) {
+                if visionEnabled && status == .starting {
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityHidden(true)
+                } else {
+                    Image(systemName: symbol)
+                        .accessibilityHidden(true)
+                }
+                Text(title)
+            }
+            .font(.footnote.weight(.semibold))
+            .foregroundStyle(active ? Color.cyan : Color.white)
+            .padding(.horizontal, 13)
+            .frame(minHeight: 44)
+            .background(.ultraThinMaterial, in: Capsule())
+            .overlay { Capsule().strokeBorder(active ? Color.cyan.opacity(0.65) : .white.opacity(0.16)) }
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.borderless)
         .accessibilityLabel(visionEnabled ? "关闭隔空互动" : "开启隔空互动")
-        .accessibilityValue(status)
+        .accessibilityValue(state)
+        .accessibilityHint(visionEnabled ? "" : "使用前置相机识别手势")
     }
 
-    private var microphoneControl: some View {
-        let listening = director.voice.isCapturingSpeech
-        return Image(systemName: "mic")
-            .font(.system(size: 21, weight: .semibold))
-            .foregroundStyle(.white)
-            .frame(width: 56, height: 56)
-            .background(.ultraThinMaterial, in: Circle())
-            .overlay { Circle().strokeBorder(.white.opacity(0.18), lineWidth: 1) }
-            .scaleEffect(micHeld && !reduceMotion ? 1.08 : 1)
-            .opacity(listening ? 0 : 1)
-            .contentShape(Circle())
-            .gesture(
-                DragGesture(minimumDistance: 0)
-                    .updating($micHeld) { _, held, _ in held = true }
-                    .onChanged { _ in
-                        guard !micStarted else { return }
-                        micStarted = true
-                        beginVoice()
-                    }
-                    .onEnded { _ in endMicHold() }
-            )
-            .accessibilityLabel("按住说话")
-            .accessibilityHint("轻点两次开启或结束连续对话")
-            .accessibilityAddTraits(.isButton)
-            .accessibilityAction { toggleConversation() }
+    private func cornerButton(_ title: String, symbol: String, highlighted: Bool = false,
+                              action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: symbol)
+                .font(.footnote.weight(.semibold))
+                .padding(.horizontal, 13)
+                .frame(minHeight: 44)
+                .background(.ultraThinMaterial, in: Capsule())
+                .background(highlighted ? Color.red.opacity(0.3) : .clear, in: Capsule())
+                .overlay { Capsule().strokeBorder(.white.opacity(0.16)) }
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func revealHomeButtons() {
+        showControlsHint = false
+        withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) { homeButtonsVisible = true }
+        homeButtonsTimer = UUID()
     }
 
     private func toggleConversation() {
+        revealHomeButtons()
         if canStopVoice {
             director.voice.cancel()
         } else {
-            beginVoice(pushToTalk: false)
+            beginVoice()
         }
     }
 
-    private func beginVoice(pushToTalk: Bool = true) {
+    private func beginVoice() {
         guard director.canUseVoice else { return }
         director.prepareForVoiceInput()
         let activeGreeting = director.voice.replyText.flatMap { text in
             [PetGreetingPeriod.morning.greeting, PetGreetingPeriod.lunch.greeting].contains(text) ? text : nil
         }
         director.voice.begin(model: model, name: displayName, personality: selectedPersonality,
-                             greeting: activeGreeting, pushToTalk: pushToTalk)
-    }
-
-    private func endMicHold() {
-        guard micStarted else { return }
-        micStarted = false
-        director.voice.end()
+                             greeting: activeGreeting, pushToTalk: false)
     }
 
     private func installVoiceReplyHandler() {
-        director.onVoiceGesture = { beginVoice(pushToTalk: false) }
+        director.onVoiceGesture = { beginVoice() }
         let selectedMode = $mode
         let timerMinutes = $nightLightMinutes
         director.voice.batteryStatusReply = { [weak director] in director?.modes.batteryVoiceReply }
@@ -636,62 +739,69 @@ struct PetScreen: View {
     private func interactionArea(expression: PetExpression, isPreviewing: Bool, isActing: Bool,
                                  pose: PetPose, drawingSize: CGSize, centerOffset: CGSize) -> some View {
         GeometryReader { geometry in
-            Rectangle().fill(.clear)
-                .contentShape(Rectangle())
-                .accessibilityHidden(expressionShowActive)
-                .gesture(
-                    LongPressGesture(minimumDuration: 0.45, maximumDistance: 12)
-                        .exclusively(before: SpatialTapGesture())
-                        .onEnded { result in
-                            switch result {
-                            case .first:
-                                showControls = true
-                            case .second(let tap):
-                                if let eye = hitEye(at: tap.location, in: geometry.size, pose: pose,
-                                                    drawingSize: drawingSize, centerOffset: centerOffset) {
-                                    director.pokeEye(eye)
-                                    return
-                                }
-                                director.respondToTap(toward: touchPoint(tap.location, in: geometry.size))
-                            }
+            PetTouchSurface { event in
+                switch event {
+                case .contact(let active):
+                    touchingPet = active
+                    revealHomeButtons()
+                case .tap(let location):
+                    let size = geometry.size
+                    if let point = facePoint(at: location, in: size, pose: pose,
+                                             drawingSize: drawingSize, centerOffset: centerOffset) {
+                        let eye = hitEye(at: point, pose: pose)
+                        if eye != nil || (abs(point.x) <= 140 && abs(point.y) <= 78) {
+                            director.respondToTap(toward: touchPoint(location, in: size), eye: eye)
+                            return
                         }
-                )
-                .simultaneousGesture(
-                    DragGesture(minimumDistance: 16)
-                        .updating($faceDragActive) { _, active, _ in active = true }
-                        .onChanged { drag in
-                            updatePetting(drag, in: geometry.size, pose: pose, drawingSize: drawingSize, centerOffset: centerOffset)
-                        }
-                        .onEnded { drag in
-                            updatePetting(drag, in: geometry.size, pose: pose, drawingSize: drawingSize, centerOffset: centerOffset)
-                            if director.isPetting {
-                                director.endPetting(completed: true)
-                                return
-                            }
-                            let distance = drag.translation
-                            guard -distance.height >= 52, -distance.height >= abs(distance.width) * 1.5 else { return }
-                            beginVoice(pushToTalk: false)
-                        },
-                    including: voiceAvailable ? .all : .none
-                )
-                .onChange(of: faceDragActive) { _, active in
-                    guard !active else { return }
-                    // Let the drag's onEnded callback apply its release pose before clearing a cancelled gesture.
-                    Task { @MainActor in
-                        await Task.yield()
-                        if !faceDragActive { director.endPetting(completed: false) }
                     }
+                    if director.browseExpressions(1) {
+                        UISelectionFeedbackGenerator().selectionChanged()
+                    }
+                case .longPress:
+                    if !canStopVoice { activePanel = .play }
+                case .stroke(let start, let location):
+                    updatePetting(from: start, to: location, in: geometry.size,
+                                  pose: pose, drawingSize: drawingSize, centerOffset: centerOffset)
+                case .strokeEnded(let upward):
+                    if director.isPetting {
+                        director.endPetting(completed: true)
+                    } else if upward {
+                        beginVoice()
+                    }
+                case .cancelled:
+                    director.endPetting(completed: false)
+                    settleGesture()
+                case .tracking(let offset):
+                    if director.canBrowseExpressions && !reduceMotion { gestureOffset = offset }
+                case .browse(let step):
+                    settleGesture()
+                    browseExpressions(step)
+                case .celebrate:
+                    settleGesture()
+                    if director.celebrateSwipe() { UIImpactFeedbackGenerator(style: .light).impactOccurred() }
                 }
+            }
+                .accessibilityElement(children: .ignore)
+                .accessibilityHidden(expressionShowActive)
                 .accessibilityLabel(expressionAccessibilityLabel(expression, isPreviewing: isPreviewing, isActing: isActing))
                 .accessibilityAddTraits(.isButton)
-                .accessibilityAction { director.respondToTap() }
-                .accessibilityAction(named: Text("戳左眼")) { director.pokeEye(.left) }
-                .accessibilityAction(named: Text("戳右眼")) { director.pokeEye(.right) }
+                .accessibilityAction {
+                    revealHomeButtons()
+                    director.respondToTap()
+                }
+                .accessibilityAction(named: Text("戳左眼")) { director.respondToTap(eye: .left) }
+                .accessibilityAction(named: Text("戳右眼")) { director.respondToTap(eye: .right) }
                 .accessibilityAction(named: Text("轻抚眼睛")) { director.playFaceAction(.squint) }
-                .accessibilityAction(named: Text("打开表情与设置")) { showControls = true }
+                .accessibilityAction(named: Text("打开玩法")) { activePanel = .play }
+                .accessibilityAction(named: Text("打开设置")) { activePanel = .settings }
                 .accessibilityActions {
                     if voiceAvailable && director.canUseVoice {
-                        Button("开始连续对话") { beginVoice(pushToTalk: false) }
+                        Button("开始连续对话") { beginVoice() }
+                    }
+                    if director.canBrowseExpressions {
+                        Button("下一个常用表情") { browseExpressions(1) }
+                        Button("上一个常用表情") { browseExpressions(-1) }
+                        Button("放彩带") { _ = director.celebrateSwipe() }
                     }
                 }
         }
@@ -822,15 +932,21 @@ struct PetScreen: View {
                        y: size.height * (heights[index] + (1 - lift) * 0.12))
     }
 
-    private func hitEye(at location: CGPoint, in size: CGSize, pose: PetPose,
-                        drawingSize: CGSize, centerOffset: CGSize) -> PetDirector.EyeSide? {
+    private func facePoint(at location: CGPoint, in size: CGSize, pose: PetPose,
+                           drawingSize: CGSize, centerOffset: CGSize) -> CGPoint? {
         let scale = min(drawingSize.width / 475, drawingSize.height / 215)
-        guard scale > 0, max(pose.hearts, pose.stars, pose.glasses, pose.spirals) < 0.75 else { return nil }
-        let x = (location.x - size.width / 2 - centerOffset.width) / scale - pose.lookX
-        let y = (location.y - size.height / 2 - centerOffset.height) / scale - pose.lookY - pose.bounce
+        guard scale > 0 else { return nil }
+        let x = (location.x - size.width / 2 - centerOffset.width - gestureOffset.width) / scale - pose.lookX
+        let y = (location.y - size.height / 2 - centerOffset.height - gestureOffset.height) / scale - pose.lookY - pose.bounce
         let angle = pose.turn * .pi / 36
-        let localX = (x * cos(angle) + y * sin(angle)) / (1 - abs(pose.turn) * 0.065)
-        let localY = -x * sin(angle) + y * cos(angle)
+        return CGPoint(x: (x * cos(angle) + y * sin(angle)) / (1 - abs(pose.turn) * 0.065),
+                       y: -x * sin(angle) + y * cos(angle))
+    }
+
+    private func hitEye(at point: CGPoint, pose: PetPose) -> PetDirector.EyeSide? {
+        guard max(pose.hearts, pose.stars, pose.glasses, pose.spirals) < 0.75 else { return nil }
+        let localX = point.x
+        let localY = point.y
         let side: PetDirector.EyeSide = localX < 0 ? .left : .right
         let eye = side == .left ? pose.left : pose.right
         let originX: CGFloat = side == .left ? -76 : 76
@@ -839,9 +955,22 @@ struct PetScreen: View {
         return dx * dx + dy * dy <= 1 ? side : nil
     }
 
-    private func updatePetting(_ drag: DragGesture.Value, in size: CGSize,
+    private func browseExpressions(_ step: Int) {
+        guard director.browseExpressions(step) else { return }
+        triedExpressionSwipe = true
+        UISelectionFeedbackGenerator().selectionChanged()
+    }
+
+    private func settleGesture() {
+        guard gestureOffset != .zero else { return }
+        withAnimation(reduceMotion ? nil : .spring(response: 0.30, dampingFraction: 0.90)) {
+            gestureOffset = .zero
+        }
+    }
+
+    private func updatePetting(from start: CGPoint, to location: CGPoint, in size: CGSize,
                                pose: PetPose, drawingSize: CGSize, centerOffset: CGSize) {
-        let distance = drag.translation
+        let distance = CGSize(width: location.x - start.x, height: location.y - start.y)
         let isHorizontal = abs(distance.width) >= 16 && abs(distance.width) > abs(distance.height) * 1.5
         if !director.isPetting {
             guard isHorizontal else { return }
@@ -849,12 +978,13 @@ struct PetScreen: View {
             let steps = max(1, Int(ceil(abs(distance.width) / 12)))
             guard (0...steps).contains(where: { step in
                 let progress = CGFloat(step) / CGFloat(steps)
-                let point = CGPoint(x: drag.startLocation.x + distance.width * progress,
-                                    y: drag.startLocation.y + distance.height * progress)
-                return hitEye(at: point, in: size, pose: pose, drawingSize: drawingSize, centerOffset: centerOffset) != nil
+                let point = CGPoint(x: start.x + distance.width * progress, y: start.y + distance.height * progress)
+                guard let local = facePoint(at: point, in: size, pose: pose,
+                                            drawingSize: drawingSize, centerOffset: centerOffset) else { return false }
+                return hitEye(at: local, pose: pose) != nil
             }) else { return }
         }
-        director.pet(toward: touchPoint(drag.location, in: size), distance: abs(distance.width))
+        director.pet(toward: touchPoint(location, in: size), distance: abs(distance.width))
     }
 
     private func touchPoint(_ location: CGPoint, in size: CGSize) -> CGPoint {
@@ -869,183 +999,549 @@ struct PetScreen: View {
         return "\(displayName)，\(expression.rawValue)"
     }
 
-    private var controls: some View {
+    private func controls(_ homePanel: HomePanel) -> some View {
         NavigationStack(path: $activityPath) {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 22) {
-                    activitySettings
-                    playSettings
-                    modeSettings
-                    expressionShowSettings
-                    displaySettings
-                    senseSettings
-                    voiceSettings
-                    voiceCommandSettings
-                    voicePlaybackSettings
-                    ForEach(PetExpression.groups.indices, id: \.self) { index in
-                        let group = PetExpression.groups[index]
-                        VStack(alignment: .leading, spacing: 10) {
-                            Text(group.title)
-                                .font(.subheadline.weight(.semibold))
-                                .foregroundStyle(.secondary)
-                                .accessibilityAddTraits(.isHeader)
-                            LazyVGrid(columns: [GridItem(.adaptive(minimum: 104), spacing: 8)], spacing: 8) {
-                                ForEach(group.expressions) { expression in
-                                    Button {
-                                        pendingExpression = expression
-                                        showControls = false
-                                    } label: {
-                                        Label(expression.rawValue, systemImage: expression.symbol)
-                                            .font(.subheadline)
-                                            .lineLimit(2)
-                                            .padding(.horizontal, 5)
-                                            .frame(maxWidth: .infinity, minHeight: 46)
-                                            .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 13))
-                                    }
-                                    .buttonStyle(.plain)
-                                }
-                            }
-                        }
-                    }
-
-                    VStack(spacing: 12) {
-                        Toggle("显示嘴巴", isOn: $showMouth)
-                        Toggle("屏幕常亮", isOn: $keepAwake)
-                    }
-                    .padding(14)
-                    .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 16))
+            Group {
+                switch homePanel {
+                case .play: playHome
+                case .settings: settingsHome
                 }
-                .frame(maxWidth: 650)
-                .padding(20)
-                .frame(maxWidth: .infinity)
             }
-            .navigationTitle("表情与设置")
+            .navigationTitle(homePanel == .play ? "玩法" : "设置")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("完成") { showControls = false }
+                    Button("完成") { activePanel = nil }
                 }
             }
-            .background(Color(red: 0.075, green: 0.066, blue: 0.13))
             .navigationDestination(for: ActivityPage.self) { page in
-                switch page {
-                case .focus:
-                    PetFocusPanel(timer: director.focusTimer, onPlay: { activityPath.append(.game) },
-                                  onClose: { showControls = false })
-                case .game:
-                    PetCatchGame(onExit: { _ = activityPath.popLast() })
-                        .toolbar(.hidden, for: .navigationBar)
+                Group {
+                    switch page {
+                    case .focus:
+                        PetFocusPanel(timer: director.focusTimer, onPlay: { activityPath.append(.game) },
+                                      onClose: { activePanel = nil })
+                    case .game:
+                        PetCatchGame(onExit: { _ = activityPath.popLast() })
+                            .toolbar(.hidden, for: .navigationBar)
+                    case .expressionPrograms:
+                        panel { expressionShowSettings }
+                            .navigationTitle("表情秀")
+                    case .morePlay:
+                        morePlay
+                            .navigationTitle("更多玩法")
+                    case .gestures:
+                        panel { interactionGuide }
+                            .navigationTitle("手势指南")
+                    case .petProfile:
+                        Form { petProfileSettings }
+                            .scrollContentBackground(.hidden)
+                            .background(panelBackground)
+                            .navigationTitle("圆圆的名字与性格")
+                    case .audio:
+                        panel {
+                            voiceCommandSettings
+                            voicePlaybackSettings
+                        }
+                        .navigationTitle("声音与唤醒")
+                        .onDisappear {
+                            director.voice.stopPreview()
+                            expressionSoundPreviewFailed = false
+                        }
+                    case .services:
+                        panel { voiceServiceSettings }
+                            .navigationTitle("语音服务")
+                        .onDisappear(perform: clearKeyEditing)
+                    case .systemPresence:
+                        panel { systemPresenceSettings }
+                            .navigationTitle("灵动岛与通知")
+                    }
+                }
+                .navigationBarBackButtonHidden()
+                .toolbar {
+                    if page != .game {
+                        ToolbarItem(placement: .topBarLeading) {
+                            Button {
+                                _ = activityPath.popLast()
+                            } label: {
+                                Label("返回", systemImage: "chevron.left")
+                                    .labelStyle(.titleAndIcon)
+                            }
+                        }
+                    }
                 }
             }
         }
         .tint(Color(red: 0.75, green: 0.69, blue: 1))
     }
 
-    private var activitySettings: some View {
-        settingsSection("活动") {
-            NavigationLink(value: ActivityPage.focus) {
+    private var playHome: some View {
+        let columns = Array(repeating: GridItem(.flexible(), spacing: 10),
+                            count: dynamicTypeSize.isAccessibilitySize ? 1 : 2)
+        return panel {
+            LazyVGrid(columns: columns, spacing: 10) {
+                ForEach(PetMode.allCases) { choice in
+                    modeCard(choice)
+                }
+            }
+            NavigationLink(value: ActivityPage.morePlay) {
                 HStack {
-                    Label("番茄钟", systemImage: "timer")
+                    Label("更多玩法", systemImage: "square.grid.2x2")
                     Spacer()
-                    if let status = director.focusTimer.statusText {
-                        Text(status)
-                            .font(.footnote.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
-                    Image(systemName: "chevron.right")
+                    Image(systemName: "chevron.forward")
                         .font(.caption.weight(.semibold))
                         .accessibilityHidden(true)
                 }
+                .font(.subheadline.weight(.medium))
+                .padding(.horizontal, 14)
                 .frame(minHeight: 44)
-                .contentShape(Rectangle())
-            }
-            NavigationLink(value: ActivityPage.game) {
-                HStack {
-                    Label("扔球接球", systemImage: "tennisball")
-                    Spacer()
-                    Image(systemName: "chevron.right")
-                        .font(.caption.weight(.semibold))
-                        .accessibilityHidden(true)
+                .background {
+                    RoundedRectangle(cornerRadius: 14)
+                        .fill(.white.opacity(0.07))
+                        .strokeBorder(.white.opacity(0.09))
                 }
-                .frame(minHeight: 44)
-                .contentShape(Rectangle())
+                .contentShape(RoundedRectangle(cornerRadius: 14))
             }
+            .buttonStyle(PlayCardButtonStyle())
         }
-        .buttonStyle(.plain)
     }
 
-    private var playSettings: some View {
-        settingsSection("和圆圆玩") {
-            HStack(spacing: 24) {
-                ForEach([PetDirector.PlayActivity.bubbles, .highFive]) { activity in
-                    Button(activity.rawValue) {
+    private func modeCard(_ choice: PetMode) -> some View {
+        let selected = mode == choice
+        let symbol: String
+        let detail: String
+        let tint: Color
+        switch choice {
+        case .normal:
+            symbol = "face.smiling"
+            detail = "自动轮播 35 个表情"
+            tint = Color(red: 0.75, green: 0.65, blue: 1)
+        case .companion:
+            symbol = "heart.fill"
+            detail = "安静待机，碰一碰就回应"
+            tint = Color(red: 1, green: 0.64, blue: 0.77)
+        case .battery:
+            symbol = "battery.50percent"
+            detail = "用表情显示电量"
+            tint = Color(red: 0.46, green: 0.9, blue: 0.73)
+        case .nightLight:
+            symbol = "moon.stars.fill"
+            detail = "留一盏暖灯"
+            tint = Color(red: 1, green: 0.76, blue: 0.45)
+        }
+
+        let shape = RoundedRectangle(cornerRadius: 20, style: .continuous)
+        return Button {
+            mode = choice
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: symbol)
+                    .font(.system(size: 29, weight: .medium))
+                    .foregroundStyle(.white)
+                    .frame(width: 54, height: 54)
+                    .background {
+                        RoundedRectangle(cornerRadius: 15, style: .continuous)
+                            .fill(
+                                LinearGradient(colors: [tint.opacity(0.52), tint.opacity(0.15)],
+                                               startPoint: .topLeading, endPoint: .bottomTrailing)
+                            )
+                            .strokeBorder(.white.opacity(0.18))
+                    }
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(choice.title)
+                        .font(.headline)
+                    Text(detail)
+                        .font(.footnote)
+                        .foregroundStyle(.white.opacity(0.76))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 4)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .padding(.trailing, 24)
+            .frame(minHeight: 74)
+            .background {
+                shape
+                    .fill(
+                        LinearGradient(colors: [tint.opacity(selected ? 0.27 : 0.19), tint.opacity(0.055)],
+                                       startPoint: .topLeading, endPoint: .bottomTrailing)
+                    )
+                    .strokeBorder(selected ? tint.opacity(0.78) : tint.opacity(0.23),
+                                  lineWidth: selected ? 1.5 : 1)
+            }
+            .overlay(alignment: .topTrailing) {
+                if selected {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 19, weight: .semibold))
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(tint)
+                        .padding(10)
+                        .accessibilityHidden(true)
+                }
+            }
+            .contentShape(shape)
+        }
+        .buttonStyle(PlayCardButtonStyle())
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(choice.title)
+        .accessibilityHint(detail)
+        .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
+    }
+
+    private var morePlay: some View {
+        panel {
+            if mode == .nightLight { nightLightSettings }
+            playSection("表情与游戏") {
+                NavigationLink(value: ActivityPage.expressionPrograms) { playTile("表情秀", symbol: "play.rectangle.fill", tint: .pink, opensPage: true) }
+                    .disabled(director.focusTimer.isFocusing)
+                ForEach(PetDirector.PlayActivity.allCases) { activity in
+                    Button {
                         pendingPlayActivity = activity
-                        showControls = false
+                        activePanel = nil
+                    } label: {
+                        playTile(activity.rawValue, symbol: activity == .bubbles ? "bubbles.and.sparkles" : "hand.raised.fill",
+                                 tint: activity == .bubbles ? .cyan : .orange)
                     }
-                    .disabled(mode == .nightLight || director.focusTimer.isFocusing || director.senses.isFaceDown)
+                    .disabled(!voiceAvailable || director.focusTimer.isFocusing)
                 }
+                NavigationLink(value: ActivityPage.game) { playTile("扔球接球", symbol: "tennisball.fill", tint: .green, opensPage: true) }
+                Button {
+                    pendingMarch = true
+                    activePanel = nil
+                } label: { playTile("听圆圆唱歌", symbol: "music.note", tint: .pink) }
+                .disabled(!voiceAvailable || director.focusTimer.isFocusing)
             }
+            playSection("陪伴与感应") {
+                NavigationLink(value: ActivityPage.focus) {
+                    playTile(director.focusTimer.isFocusing ? "查看专注" : "番茄钟",
+                             symbol: "timer", tint: .orange, opensPage: true)
+                }
+                Button {
+                    visionEnabled.toggle()
+                    activePanel = nil
+                } label: {
+                    playTile(visionEnabled ? "关闭隔空" : "隔空互动", symbol: "eye.fill", tint: .cyan, isActive: visionEnabled)
+                }
+                .disabled(!visionEnabled && (!voiceAvailable || director.focusTimer.isFocusing))
+                Button {
+                    motion.toggle()
+                    activePanel = nil
+                } label: {
+                    playTile(motion ? "关闭体感" : "摇一摇", symbol: "iphone.gen3.radiowaves.left.and.right",
+                             tint: .blue, isActive: motion)
+                }
+                .disabled(!motion && (mode == .nightLight || director.focusTimer.isFocusing))
+                Button {
+                    sound.toggle()
+                    activePanel = nil
+                } label: {
+                    playTile(sound ? "关闭声音感应" : "拍手与吹气", symbol: "waveform", tint: .mint, isActive: sound)
+                }
+                .disabled(!sound && (mode == .nightLight || director.focusTimer.isFocusing))
+            }
+            NavigationLink(value: ActivityPage.gestures) {
+                playTile("手势指南", symbol: "hand.draw.fill", tint: .indigo, opensPage: true)
+            }
+            .buttonStyle(PlayCardButtonStyle())
+            Divider().overlay(.white.opacity(0.07))
+            expressionLibrary
         }
     }
 
-    private var displaySettings: some View {
-        settingsSection("屏幕与按钮") {
-            HStack {
-                Text("屏幕方向")
-                Spacer()
-                Picker("屏幕方向", selection: $screenOrientation) {
-                    ForEach(PetScreenOrientation.allCases) { choice in
-                        Text(choice.title).tag(choice)
-                    }
-                }
-                .labelsHidden()
-                .pickerStyle(.menu)
-            }
-            Toggle("显示设置按钮", isOn: $showSettingsButton)
-            if !showSettingsButton { settingsNote("长按桌宠，打开表情与设置。") }
-            Toggle("显示按住说话按钮", isOn: $showVoiceButton)
-            Toggle("显示表情和待机提示", isOn: $showPetCaption)
-            Toggle("主动问候", isOn: $proactiveGreetings)
-            settingsNote("早上和中午，圆圆会在主画面空闲时各问候一次。")
-            settingsNote("点麦克风或向上滑开始聊天，停顿后自动发送。")
+    private func playSection<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .accessibilityAddTraits(.isHeader)
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: dynamicTypeSize.isAccessibilitySize ? 300 : 195), spacing: 8)], spacing: 8, content: content)
+                .buttonStyle(PlayCardButtonStyle())
         }
     }
 
-    private var modeSettings: some View {
-        settingsSection("模式") {
-            Picker("桌宠模式", selection: $mode) {
-                ForEach(PetMode.allCases) { choice in Text(choice.title).tag(choice) }
+    private var settingsHome: some View {
+        Form {
+            Section("日常偏好") {
+                Toggle(isOn: $proactiveGreetings) { panelLabel("主动问候", symbol: "sun.max.fill", tint: .orange) }
+                Toggle(isOn: $keepAwake) { panelLabel("屏幕常亮", symbol: "sun.horizon.fill", tint: .yellow) }
+                Toggle(isOn: $showMouth) { panelLabel("显示嘴巴", symbol: "face.smiling", tint: .pink) }
+                Toggle(isOn: $lightweightDisplay) { panelLabel("省电显示", symbol: "leaf.fill", tint: .green) }
+                Text("简化边缘光效，降低待机刷新频率。系统低电量或设备过热时也会自动启用。")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            Section("圆圆与语音") {
+                NavigationLink(value: ActivityPage.petProfile) {
+                    LabeledContent {
+                        Text(displayName).lineLimit(1)
+                    } label: {
+                        panelLabel("名字与性格", symbol: "person.crop.circle.fill", tint: .purple)
+                    }
+                }
+                NavigationLink(value: ActivityPage.audio) {
+                    panelLabel("声音与唤醒", symbol: "speaker.wave.2.fill", tint: .pink)
+                }
+                NavigationLink(value: ActivityPage.services) {
+                    LabeledContent {
+                        Text(director.voice.hasDeepSeekKey || director.voice.hasDoubaoKey ? "已配置" : "本机")
+                    } label: {
+                        panelLabel("语音服务", symbol: "waveform", tint: .blue)
+                    }
+                }
+            }
+            Section("系统") {
+                NavigationLink(value: ActivityPage.systemPresence) {
+                    panelLabel("灵动岛与通知", symbol: "bell.fill", tint: .indigo)
+                }
+            }
+        }
+        .scrollContentBackground(.hidden)
+        .background(panelBackground)
+    }
+
+    private var petProfileSettings: some View {
+        Section {
+            TextField("宠物名字", text: $petName)
+                .accessibilityLabel("宠物名字")
+            Picker("性格", selection: $personality) {
+                ForEach(["黏人", "傲娇", "元气", "自定义"], id: \.self) { choice in Text(choice) }
+            }
+            if personality == "自定义" {
+                TextField("用一句话描述它的性格", text: $customPersonality)
+            }
+        } footer: {
+            Text("名字用于首页和语音唤醒。自由聊天会使用所选性格。")
+        }
+    }
+
+    private func clearKeyEditing() {
+        keyCheckTask?.cancel()
+        keyCheckTask = nil
+        checkingKey = nil
+        keyInputs.removeAll()
+        keyMessages.removeAll()
+    }
+
+    private var systemPresenceSettings: some View {
+        settingsSection("灵动岛与消息提醒") {
+            Toggle("灵动岛陪伴", isOn: $liveCompanion)
+                .onChange(of: liveCompanion) { _, enabled in
+                    Task { await systemPresence.syncCompanion(enabled: enabled, name: displayName) }
+                }
+            .disabled(systemPresence.changingCompanion)
+            if liveCompanion, systemPresence.isCompanionActive {
+                Label("陪伴中", systemImage: "checkmark.circle")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            settingsNote("有灵动岛的机型可在岛上看到圆圆，其他支持实时活动的机型可在锁屏查看。")
+            Text("刘海屏预览")
+                .font(.subheadline.weight(.semibold))
+            notchEyePreview
+
+            Toggle("消息通知横幅", isOn: Binding {
+                messageBanners
+            } set: { enabled in
+                if enabled {
+                    Task { messageBanners = await systemPresence.enableMessageBanners() }
+                } else {
+                    messageBanners = false
+                }
+            })
+            settingsNote("在「快捷指令」的自动化里添加「提醒圆圆有新消息」，并在「来源 App」填写应用名，例如「信息」或「邮件」。")
+            Button("试一下消息提醒") {
+                activePanel = nil
+                Task { await previewMessageReminder(sourceApp: "信息") }
+            }
+            .buttonStyle(.bordered)
+
+            if let notice = systemPresence.notice { permissionLink(notice) }
+        }
+    }
+
+    private var notchEyePreview: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: reduceMotion || scenePhase != .active)) { timeline in
+            let time = timeline.date.timeIntervalSinceReferenceDate
+            let gaze = reduceMotion ? 0 : sin(time * .pi / 2)
+            let blinkTime = abs(time.truncatingRemainder(dividingBy: 4.8) - 4.5)
+            let openness = reduceMotion ? 1 : min(1, 0.16 + blinkTime / 0.13)
+            VStack(spacing: 0) {
+                HStack(spacing: 12) {
+                    PetCompanionEye(width: 14, gaze: gaze, openness: openness, animatesGaze: false)
+                    UnevenRoundedRectangle(bottomLeadingRadius: 15, bottomTrailingRadius: 15)
+                        .fill(.black)
+                        .frame(width: 108, height: 25)
+                        .overlay {
+                            Capsule().fill(.white.opacity(0.14)).frame(width: 24, height: 2)
+                        }
+                    PetCompanionEye(width: 14, gaze: gaze, openness: openness, animatesGaze: false)
+                }
+                .frame(maxWidth: .infinity, minHeight: 40, alignment: .top)
+
+                PetCompanionCard(name: displayName, status: "正在陪伴你", hasMessage: false,
+                                 gaze: gaze, openness: openness, animatesGaze: false)
+            }
+            .background(PetCompanionCard.background, in: RoundedRectangle(cornerRadius: 16))
+        }
+        .accessibilityRepresentation { Text("\(displayName)正在陪伴你。刘海两侧的眼睛左右张望并眨眼。") }
+    }
+
+    private func previewMessageReminder(sourceApp: String? = nil) async {
+        await systemPresence.requestBannerPermissionIfNeeded()
+        try? await systemPresence.receiveMessage(sourceApp: sourceApp)
+    }
+
+    private var panelBackground: some View {
+        LinearGradient(
+            colors: [Color(red: 0.12, green: 0.105, blue: 0.20),
+                     Color(red: 0.055, green: 0.06, blue: 0.10),
+                     Color(red: 0.036, green: 0.038, blue: 0.062)],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+        )
+        .ignoresSafeArea()
+    }
+
+    private func panel<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14, content: content)
+                .frame(maxWidth: 650)
+                .padding(.horizontal, 20)
+                .padding(.vertical, 12)
+                .frame(maxWidth: .infinity)
+        }
+        .background(panelBackground)
+    }
+
+    private func panelIcon(_ symbol: String, tint: Color, size: CGFloat) -> some View {
+        Image(systemName: symbol)
+            .font(.system(size: size * 0.49, weight: .semibold))
+            .foregroundStyle(.white)
+            .frame(width: size, height: size)
+            .background {
+                RoundedRectangle(cornerRadius: size * 0.26)
+                    .fill(
+                        LinearGradient(colors: [tint.opacity(0.65), tint.opacity(0.22)],
+                                       startPoint: .topLeading, endPoint: .bottomTrailing)
+                    )
+                    .strokeBorder(.white.opacity(0.12))
+            }
+            .accessibilityHidden(true)
+    }
+
+    private func panelLabel(_ title: String, symbol: String, tint: Color) -> some View {
+        HStack(spacing: 10) {
+            panelIcon(symbol, tint: tint, size: 29)
+            Text(title)
+        }
+    }
+
+    private func playTile(_ title: String, symbol: String, tint: Color = .purple,
+                          opensPage: Bool = false, isActive: Bool = false) -> some View {
+        let shape = RoundedRectangle(cornerRadius: 15, style: .continuous)
+        return HStack(spacing: 9) {
+            panelIcon(symbol, tint: tint, size: 34)
+            Text(title)
+                .font(.subheadline.weight(.medium))
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+            if isActive {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(tint)
+                    .accessibilityLabel("已开启")
+            } else if opensPage {
+                Image(systemName: "chevron.forward")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .frame(minHeight: 48)
+        .background {
+            shape
+                .fill(
+                    LinearGradient(colors: [tint.opacity(isActive ? 0.25 : 0.13), .white.opacity(0.045)],
+                                   startPoint: .topLeading, endPoint: .bottomTrailing)
+                )
+                .strokeBorder(isActive ? tint.opacity(0.62) : .white.opacity(0.10))
+        }
+        .contentShape(shape)
+    }
+
+    private var expressionLibrary: some View {
+        let groups = PetExpression.groups
+        let categoryNames = ["心情", "动作", "彩蛋"]
+        let expressions = expressionCategory == 0 ? PetExpression.quickExpressions : groups[expressionCategory - 1].expressions
+        let tint: Color = switch expressionCategory {
+        case 2: .cyan
+        case 3: .orange
+        default: .purple
+        }
+        let unavailableReason: String? = if director.focusTimer.isFocusing {
+            "专注结束后可以播放表情。"
+        } else if mode == .nightLight {
+            "退出夜灯后可以播放表情。"
+        } else {
+            nil
+        }
+        return VStack(alignment: .leading, spacing: 10) {
+            Text("选表情")
+                .font(.headline)
+                .accessibilityAddTraits(.isHeader)
+            if let unavailableReason { settingsNote(unavailableReason) }
+            Picker("表情分类", selection: $expressionCategory) {
+                Text("常用").tag(0)
+                ForEach(groups.indices, id: \.self) { index in
+                    Text(categoryNames[index]).tag(index + 1)
+                }
             }
             .pickerStyle(.segmented)
-            if mode == .normal { settingsNote("自动换表情，轻点时看向触点并播放下一个。") }
-            if mode == .companion { settingsNote("安静陪伴，轻点会回应。") }
-            if mode == .nightLight {
-                Picker("夜灯定时", selection: $nightLightMinutes) {
-                    ForEach(PetModes.timerOptions, id: \.self) { minutes in
-                        Text(minutes == 0 ? "不定时" : "\(minutes) 分钟").tag(minutes)
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: dynamicTypeSize.isAccessibilitySize ? 250 : 142), spacing: 8)], spacing: 8) {
+                ForEach(expressions) { expression in
+                    Button {
+                        pendingExpression = expression
+                        activePanel = nil
+                    } label: {
+                        playTile(expression.rawValue, symbol: expression.symbol, tint: tint)
                     }
                 }
-                .pickerStyle(.menu)
-                if director.modes.nightLightExpired {
-                    Button("重新开启夜灯") {
-                        director.modes.restartNightLight(minutes: nightLightMinutes)
-                    }
+            }
+            .buttonStyle(PlayCardButtonStyle())
+            .disabled(unavailableReason != nil)
+            if expressionCategory == 0 && unavailableReason == nil {
+                settingsNote("点首页空白处看下一个，双指左右滑可以前后切换。")
+            }
+        }
+    }
+
+    private var nightLightSettings: some View {
+        settingsSection("夜灯") {
+            Picker("夜灯定时", selection: $nightLightMinutes) {
+                ForEach(PetModes.timerOptions, id: \.self) { minutes in
+                    Text(minutes == 0 ? "不定时" : "\(minutes) 分钟").tag(minutes)
+                }
+            }
+            .pickerStyle(.menu)
+            if director.modes.nightLightExpired {
+                Button("重新开启夜灯") {
+                    director.modes.restartNightLight(minutes: nightLightMinutes)
                 }
             }
         }
     }
 
     private var expressionShowSettings: some View {
-        settingsSection("表情秀") {
+        settingsSection("选择节目") {
             ForEach(PetExpressionShow.allCases) { program in
                 Button {
                     pendingExpressionShow = program
-                    showControls = false
+                    activePanel = nil
                 } label: {
                     HStack(spacing: 10) {
-                        Image(systemName: "play.circle")
-                            .font(.title3)
-                            .accessibilityHidden(true)
+                        panelIcon("play.fill", tint: .pink, size: 34)
                         VStack(alignment: .leading, spacing: 3) {
                             Text(program.title)
                                 .font(.subheadline.weight(.semibold))
@@ -1068,52 +1564,24 @@ struct PetScreen: View {
         return "约 \(seconds) 秒"
     }
 
-    private var senseSettings: some View {
-        settingsSection("互动感知") {
-            Toggle("眼神跟随（手和脸）", isOn: $eyeTracking)
-                .onChange(of: eyeTracking) { _, enabled in
-                    if enabled && mode != .nightLight { director.senses.requestCameraPermission() }
-                }
-            Toggle("手势互动", isOn: $handGestures)
-                .onChange(of: handGestures) { _, enabled in
-                    if enabled && mode != .nightLight { director.senses.requestCameraPermission() }
-                }
-            if handGestures {
-                VStack(alignment: .leading, spacing: 6) {
-                    Label("张开手掌，左右来回挥：圆圆挥手打招呼", systemImage: "hand.wave")
-                    Label("五指张开再收拢：开始语音对话", systemImage: "hand.raised")
-                    Label("双手食指尖和拇指尖相碰，围成心形", systemImage: "heart")
-                    Label("收起四指，竖起大拇指", systemImage: "hand.thumbsup")
-                }
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                if director.focusTimer.isFocusing {
-                    settingsNote("专注计时期间会暂停手势互动。")
-                } else if mode != .nightLight {
-                    settingsNote("回到主画面就能试一试。")
-                }
+    private var interactionGuide: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            settingsSection("触屏") {
+                settingsNote("点圆圆的脸或摸摸它，点空白处换表情。")
+                settingsNote("双指左右滑换表情，三指上滑放彩带。单指上滑开始聊天。")
             }
-            settingsNote("点主画面右下角的眼睛开启隔空互动。伸出食指可戳泡泡，举掌停稳后向前推可击掌。")
-            if visionEnabled || eyeTracking || handGestures {
-                switch director.senses.cameraStatus {
-                case .denied: permissionLink("相机权限未开启")
-                case .unavailable: settingsNote("当前设备无法使用前置相机。")
-                default: EmptyView()
-                }
+            settingsSection("隔空与感应") {
+                settingsNote("点首页右下角的眼睛开启隔空互动。挥手打招呼，伸食指戳泡泡，举掌停稳后向前推可以击掌。也可以比心、点赞，或张掌后收拢手指开始聊天。")
+                settingsNote("体感：摇一摇、倾斜手机，或翻面让圆圆睡觉。")
+                settingsNote("声音：试试拍手、吹气，或放一段有节奏的音乐。夜灯和专注期间会暂停感应。")
+                if motion && director.senses.motionUnavailable { settingsNote("当前设备无法使用运动传感器。") }
+                if sound && director.audio.microphoneDenied { permissionLink("麦克风权限未开启") }
             }
-            Toggle("体感", isOn: $motion)
-            if motion && director.senses.motionUnavailable { settingsNote("当前设备无法使用运动传感器。") }
-            Toggle("声音反应", isOn: $sound)
-                .onChange(of: sound) { _, enabled in
-                    if enabled && mode != .nightLight { director.audio.requestAmbientPermission() }
-                }
-            if sound && director.audio.microphoneDenied { permissionLink("麦克风权限未开启") }
-            if mode == .nightLight { settingsNote("夜灯模式会暂停相机和麦克风。") }
         }
     }
 
-    private var voiceSettings: some View {
-        settingsSection("语音对话") {
+    private var voiceServiceSettings: some View {
+        settingsSection("云端服务（可选）") {
             apiKeySettings(.deepSeek, configured: director.voice.hasDeepSeekKey,
                            detail: "生成聊天回复。自由聊天会发送转写文字和近期对话。")
             TextField("模型名称", text: $model, prompt: Text(DeepSeekClient.defaultModel))
@@ -1121,16 +1589,6 @@ struct PetScreen: View {
                 .autocorrectionDisabled()
                 .textFieldStyle(.roundedBorder)
                 .disabled(checkingKey == .deepSeek)
-            TextField("宠物名字", text: $petName)
-                .textFieldStyle(.roundedBorder)
-            Picker("性格", selection: $personality) {
-                ForEach(["黏人", "傲娇", "元气", "自定义"], id: \.self) { choice in Text(choice) }
-            }
-            .pickerStyle(.segmented)
-            if personality == "自定义" {
-                TextField("用一句话描述它的性格", text: $customPersonality)
-                    .textFieldStyle(.roundedBorder)
-            }
             Divider()
             apiKeySettings(.doubao, configured: director.voice.hasDoubaoKey,
                            detail: "负责实时转写和团子音色播报。未配置时使用 iPhone 本机语音。")
@@ -1181,41 +1639,42 @@ struct PetScreen: View {
         settingsSection("播报音色") {
             settingsNote(director.voice.hasDoubaoKey ? "豆包语音 · 团子音色" : "内置普通话女声 · 离线播报")
             if let status = director.voice.voiceOutputNotice { settingsNote(status) }
-            Button(director.voice.isPreviewing ? "停止试听" : "试听当前音色") {
+            Button {
                 if director.voice.isPreviewing {
                     director.voice.stopPreview()
                 } else {
                     director.prepareForVoiceInput()
                     director.voice.previewVoice()
                 }
+            } label: {
+                playTile(director.voice.isPreviewing ? "停止试听" : "试听当前音色",
+                         symbol: director.voice.isPreviewing ? "stop.fill" : "play.fill", tint: .pink)
             }
-            .font(.footnote)
+            .buttonStyle(PlayCardButtonStyle())
         }
     }
 
     private var voiceCommandSettings: some View {
-        settingsSection("语音唤醒与表情音效") {
-            Toggle("喊名字唤醒", isOn: $voiceWakeEnabled)
+        settingsSection("唤醒与音效") {
+            Toggle(isOn: $voiceWakeEnabled) {
+                panelLabel("喊名字唤醒", symbol: "mic.fill", tint: .purple)
+            }
             settingsNote("开启后，麦克风只在主画面用本机识别名字。说「嘿，\(displayName)」，停一下再说指令。")
-            Toggle("表情音效", isOn: $expressionSounds)
-                .onChange(of: expressionSounds) { _, _ in expressionSoundPreviewFailed = false }
+            Toggle(isOn: $expressionSounds) {
+                panelLabel("表情音效", symbol: "speaker.wave.2.fill", tint: .pink)
+            }
+            .onChange(of: expressionSounds) { _, _ in expressionSoundPreviewFailed = false }
             settingsNote("开启后，35 个表情各有短音效。静音模式下也会播放，音量跟随 iPhone 的媒体音量。")
-            Button("试听表情音效") {
+            Button {
                 director.configure(settings)
                 expressionSoundPreviewFailed = !director.previewExpressionSound()
+            } label: {
+                playTile("试听表情音效", symbol: "play.fill", tint: .purple)
             }
-            .font(.footnote)
+            .buttonStyle(PlayCardButtonStyle())
             .disabled(!expressionSounds)
             if expressionSounds && expressionSoundPreviewFailed {
                 settingsNote("暂时无法播放，请稍后再试。")
-            }
-            settingsNote("「给我唱首歌」或「唱圆圆进行曲」可播放固定歌曲。也可以说「跳个舞」「比个心」「吹泡泡」。")
-            if mode != .nightLight {
-                Button("试听圆圆进行曲") {
-                    pendingMarch = true
-                    showControls = false
-                }
-                .disabled(director.senses.isFaceDown)
             }
             if let notice = director.voice.wakeNotice { settingsNote(notice) }
             if let transcript = director.voice.lastTranscript, !transcript.isEmpty {
@@ -1306,6 +1765,196 @@ struct PetScreen: View {
             keyMessages[account] = account == .doubao ? "Key 已移除，已切回本机语音。" : "Key 已移除。"
         } catch {
             keyMessages[account] = Self.keyCheckMessage(for: error)
+        }
+    }
+}
+
+private struct PlayCardButtonStyle: ButtonStyle {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .opacity(!isEnabled ? 0.45 : configuration.isPressed ? 0.82 : 1)
+            .scaleEffect(configuration.isPressed && !reduceMotion ? 0.985 : 1)
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.14), value: configuration.isPressed)
+    }
+}
+
+private struct PetTouchSurface: UIViewRepresentable {
+    enum Event {
+        case tap(CGPoint), longPress, stroke(CGPoint, CGPoint), strokeEnded(upward: Bool), cancelled
+        case browse(Int), celebrate, tracking(CGSize), contact(Bool)
+    }
+
+    let handle: (Event) -> Void
+
+    func makeUIView(context: Context) -> Surface {
+        let surface = Surface(frame: .zero)
+        surface.isMultipleTouchEnabled = true
+        return surface
+    }
+
+    func updateUIView(_ view: Surface, context: Context) {
+        view.handle = handle
+    }
+
+    final class Surface: UIView {
+        var handle: ((Event) -> Void)?
+        private var starts: [UITouch: CGPoint] = [:]
+        private var active: Set<UITouch> = []
+        private var swipe: Event?
+        private var firstTouchAt: TimeInterval?
+        private var didLift = false
+        private var invalidated = false
+        private var longPressed = false
+        private var moved = false
+        private var longPress: Task<Void, Never>?
+
+        override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+            let isFirstContact = active.isEmpty
+            active.formUnion(touches)
+            if isFirstContact { handle?(.contact(true)) }
+            let timestamp = touches.map(\.timestamp).min() ?? 0
+            if firstTouchAt == nil { firstTouchAt = timestamp }
+            if didLift || timestamp - (firstTouchAt ?? timestamp) > 0.24 { invalidated = true }
+            for touch in touches { starts[touch] = touch.location(in: self) }
+            if starts.count > 1 {
+                longPress?.cancel()
+                if moved { handle?(.cancelled) }
+            } else {
+                longPress = Task { [weak self] in
+                    do { try await Task.sleep(for: .milliseconds(450)) } catch { return }
+                    guard let self, active.count == 1, !moved else { return }
+                    longPressed = true
+                    handle?(.longPress)
+                }
+            }
+        }
+
+        override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+            guard !invalidated, !longPressed, !didLift else { return }
+            if starts.count > 1 {
+                handle?(.tracking(Self.previewOffset(for: offsets)))
+            } else if let touch = touches.first, let start = starts[touch] {
+                trackStroke(from: start, to: touch.location(in: self))
+            }
+        }
+
+        override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+            longPress?.cancel()
+            if starts.count > 1 && !didLift && !longPressed {
+                swipe = Self.swipe(for: offsets)
+            }
+            didLift = true
+            active.subtract(touches)
+            guard active.isEmpty else { return }
+            defer {
+                reset()
+                handle?(.contact(false))
+            }
+            guard !invalidated && !longPressed else {
+                handle?(.cancelled)
+                return
+            }
+            if starts.count > 1 {
+                handle?(swipe ?? .cancelled)
+            } else if let touch = touches.first, let start = starts[touch] {
+                let point = touch.location(in: self)
+                trackStroke(from: start, to: point)
+                if moved {
+                    let up = start.y - point.y
+                    handle?(.strokeEnded(upward: up >= 52 && up >= abs(point.x - start.x) * 1.5))
+                } else {
+                    handle?(.tap(point))
+                }
+            }
+        }
+
+        override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+            invalidated = true
+            didLift = true
+            longPress?.cancel()
+            handle?(.cancelled)
+            active.subtract(touches)
+            if active.isEmpty {
+                reset()
+                handle?(.contact(false))
+            }
+        }
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            if window == nil {
+                let hadContact = !active.isEmpty
+                reset()
+                if hadContact {
+                    Task { [handle] in
+                        handle?(.cancelled)
+                        handle?(.contact(false))
+                    }
+                }
+            }
+        }
+
+        private func trackStroke(from start: CGPoint, to point: CGPoint) {
+            if hypot(point.x - start.x, point.y - start.y) > 12 {
+                moved = true
+                longPress?.cancel()
+            }
+            if moved { handle?(.stroke(start, point)) }
+        }
+
+        private var offsets: [CGSize] {
+            starts.map { touch, start in
+                let point = touch.location(in: self)
+                return CGSize(width: point.x - start.x, height: point.y - start.y)
+            }
+        }
+
+        private static func previewOffset(for offsets: [CGSize]) -> CGSize {
+            if offsets.count == 2 {
+                for direction: CGFloat in [-1, 1] where offsets.allSatisfy({ $0.width * direction > abs($0.height) * 1.5 }) {
+                    let travel = offsets.map { $0.width * direction }.min() ?? 0
+                    return CGSize(width: direction * min(18, max(0, travel - 8) * 0.3), height: 0)
+                }
+            }
+            if offsets.count == 3 && offsets.allSatisfy({ -$0.height > abs($0.width) * 1.5 }) {
+                let travel = offsets.map { -$0.height }.min() ?? 0
+                return CGSize(width: 0, height: -min(14, max(0, travel - 8) * 0.25))
+            }
+            return .zero
+        }
+
+        private static func swipe(for offsets: [CGSize]) -> Event? {
+            // Every finger must travel in the same direction; pinches and stationary fingers don't count.
+            if offsets.count == 2 {
+                for step in [1, -1] where offsets.allSatisfy({ offset in
+                    let forward = -offset.width * CGFloat(step)
+                    return forward >= 44 && forward >= abs(offset.height) * 1.5
+                }) {
+                    return .browse(step)
+                }
+            }
+            if offsets.count == 3 && offsets.allSatisfy({
+                -$0.height >= 52 && -$0.height >= abs($0.width) * 1.5
+            }) {
+                return .celebrate
+            }
+            return nil
+        }
+
+        private func reset() {
+            longPress?.cancel()
+            longPress = nil
+            starts.removeAll()
+            active.removeAll()
+            swipe = nil
+            firstTouchAt = nil
+            didLift = false
+            invalidated = false
+            longPressed = false
+            moved = false
         }
     }
 }

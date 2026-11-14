@@ -5,7 +5,7 @@ import UserNotifications
 @MainActor
 @Observable
 final class PetDirector {
-    enum PlayActivity: String, Identifiable {
+    enum PlayActivity: String, CaseIterable, Identifiable {
         case bubbles = "戳泡泡"
         case highFive = "击掌"
 
@@ -50,8 +50,6 @@ final class PetDirector {
         var mode: PetMode
         var nightLightMinutes: Int
         var keepAwake: Bool
-        var eyeTracking: Bool
-        var handGestures: Bool
         var visionEnabled: Bool
         var motion: Bool
         var sound: Bool
@@ -62,7 +60,10 @@ final class PetDirector {
         var focusing = false
     }
 
-    @ObservationIgnored private var playback = PetPlayback()
+    @ObservationIgnored private var playback = PetPlayback() {
+        didSet { updateAnimationCadence(at: now) }
+    }
+    private(set) var isAnimatingExpression = false
     @ObservationIgnored private let petAudio: PetAudioPlayer
     @ObservationIgnored private var expressionSoundTask: Task<Void, Never>?
     @ObservationIgnored private var expressionSoundPass: SoundPass?
@@ -78,8 +79,8 @@ final class PetDirector {
     @ObservationIgnored private var followUp: (expression: PetExpression, at: TimeInterval)?
     private static let rotationKey = "pet.normalExpressionRound"
     @ObservationIgnored private var rotation = PetRotationRound.restored(from: UserDefaults.standard.data(forKey: rotationKey))
+    @ObservationIgnored private var quickExpressionIndex: Int?
     @ObservationIgnored private var nextRotationAt: TimeInterval?
-    @ObservationIgnored private var rotationTapQueued = false
     private(set) var expressionShow: (program: PetExpressionShow, index: Int)?
     private(set) var completedExpressionShow: PetExpressionShow?
     @ObservationIgnored private var nextShowStepAt: TimeInterval?
@@ -159,10 +160,13 @@ final class PetDirector {
     private var isCompanionMode: Bool { settings?.mode == .normal || settings?.mode == .companion }
 
     private var touchAllowed: Bool {
+        touchContextAvailable && !playback.isPreviewing(at: now)
+    }
+
+    private var touchContextAvailable: Bool {
         guard let settings else { return false }
         return expressionShow == nil && settings.foreground && !settings.controlsOpen && !settings.focusing && !isPlayingMarch
             && settings.mode != .nightLight && !senses.isFaceDown && !modes.isCharging
-            && !playback.isPreviewing(at: now)
     }
 
     var canPet: Bool {
@@ -195,9 +199,10 @@ final class PetDirector {
             stopExpressionAudio()
             isPreviewingExpressionAudio = false
             nextRotationAt = nil
-            rotationTapQueued = false
             stopExpressionShow()
-            if playback.isPlayingRotation(at: time) || playback.isPreviewing(at: time) { refreshBaseline(interrupt: true) }
+            if playback.isPlayingRotation(at: time) || playback.isPreviewing(at: time) || playback.isBrowsing(at: time) {
+                refreshBaseline(interrupt: true)
+            }
         }
         if modeChanged || controlsChanged || !settings.foreground || !settings.expressionSoundsEnabled {
             stopExpressionSoundSample()
@@ -245,7 +250,6 @@ final class PetDirector {
         voice.cancel()
         followUp = nil
         nextRotationAt = nil
-        rotationTapQueued = false
         nextAmbientAt = nil
         chargingStartedAt = nil
         chargeCompletionPending = false
@@ -264,7 +268,7 @@ final class PetDirector {
             }
         }
 
-        if settings.map({ $0.visionEnabled || $0.eyeTracking || $0.handGestures || $0.motion }) == true { updateOrientation() }
+        if settings.map({ $0.visionEnabled || $0.motion }) == true { updateOrientation() }
         finishRotation(at: time)
         modes.tick()
         refreshBaseline()
@@ -296,6 +300,11 @@ final class PetDirector {
         if visionHint != nil, time >= visionHintUntil { visionHint = nil }
     }
 
+    private func updateAnimationCadence(at time: TimeInterval) {
+        let animating = playback.hasActiveSelection(at: time) || playback.baseline != .idle
+        if animating != isAnimatingExpression { isAnimatingExpression = animating }
+    }
+
     func show(_ expression: PetExpression) {
         endPlay()
         clearTouch()
@@ -306,15 +315,56 @@ final class PetDirector {
         followUp = nil
         nextAmbientAt = nil
         nextRotationAt = nil
-        rotationTapQueued = false
+        quickExpressionIndex = PetExpression.quickExpressions.firstIndex(of: expression)
         playback.show(expression, at: now)
         isPreviewingExpressionAudio = settings?.expressionSoundsEnabled == true
         updateExpressionAudio(at: now)
     }
 
-    func respondToTap(toward point: CGPoint = .zero) {
-        guard expressionShow == nil, !isPlayingMarch else { return }
-        guard settings?.focusing != true, playSession == nil, !isPetting else { return }
+    var canBrowseExpressions: Bool {
+        touchContextAvailable && isCompanionMode && playSession == nil && voice.phase == .idle && !isPetting
+    }
+
+    @discardableResult
+    func browseExpressions(_ step: Int) -> Bool {
+        guard canBrowseExpressions else { return false }
+        let expressions = PetExpression.quickExpressions
+        let current = quickExpressionIndex ?? (step > 0 ? -1 : 0)
+        let index = (current + step + expressions.count) % expressions.count
+        quickExpressionIndex = index
+        playGestureExpression(expressions[index])
+        return true
+    }
+
+    @discardableResult
+    func celebrateSwipe() -> Bool {
+        guard canBrowseExpressions else { return false }
+        playGestureExpression(.celebrate)
+        return true
+    }
+
+    func tapBurstAge(at time: TimeInterval) -> TimeInterval? {
+        playback.isTapBurst(at: time) ? playback.elapsed(at: time) : nil
+    }
+
+    func isBrowsingExpression(at time: TimeInterval) -> Bool {
+        playback.isBrowsing(at: time)
+    }
+
+    private func playGestureExpression(_ expression: PetExpression) {
+        clearTouch()
+        completedExpressionShow = nil
+        followUp = nil
+        nextAmbientAt = nil
+        nextRotationAt = nil
+        let time = now
+        finishRotation(at: time)
+        playback.playQuickExpression(expression, at: time)
+        updateExpressionAudio(at: time)
+    }
+
+    func respondToTap(toward point: CGPoint = .zero, eye: EyeSide? = nil) {
+        guard touchAllowed, playSession == nil, !isPetting, voice.phase == .idle else { return }
         eyePoke = nil
         completedExpressionShow = nil
         followUp = nil
@@ -322,28 +372,18 @@ final class PetDirector {
         nextRotationAt = nil
         let time = now
         finishRotation(at: time)
-        if settings?.mode != .nightLight && !senses.isFaceDown {
-            tapAttention = (point, time + 0.65)
-        }
-        guard voice.phase == .idle, !modes.isCharging else { return }
+        tapAttention = (point, time + 0.65)
         let gaze = CGPoint(x: point.x * 16, y: point.y * 9)
-        switch settings?.mode {
-        case .normal:
-            guard reactionsAllowed else { return }
-            if playback.hasActiveSelection(at: time) {
-                rotationTapQueued = true
-            } else {
-                playRotation(at: time)
-            }
-        case .companion:
-            playback.respondToCompanionTap(at: time, toward: gaze)
-        default:
-            playback.respondToTap(at: time, toward: gaze)
+        let wasBursting = playback.isTapBurst(at: time)
+        let reaction = playback.respondToTap(at: time, toward: gaze)
+        if !wasBursting && playback.isTapBurst(at: time) {
+            UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
         }
+        if reaction == .happy, let eye { eyePoke = (eye, time) }
         updateExpressionAudio(at: time)
     }
 
-    func pokeEye(_ side: EyeSide) {
+    private func pokeEye(_ side: EyeSide) {
         guard touchAllowed, strokeAttention == nil, playSession == nil else { return }
         completedExpressionShow = nil
         followUp = nil
@@ -375,7 +415,6 @@ final class PetDirector {
         followUp = nil
         nextAmbientAt = nil
         nextRotationAt = nil
-        rotationTapQueued = false
         let time = now
         finishRotation(at: time)
         if activity == .bubbles {
@@ -412,8 +451,8 @@ final class PetDirector {
         guard let settings else { return }
         let cameraAllowed = expressionShow == nil && !isPlayingMarch && !settings.focusing
         senses.configure(active: settings.foreground && !settings.controlsOpen && !settings.focusing,
-                         eyeTracking: cameraAllowed && (settings.visionEnabled || settings.eyeTracking),
-                         handGestures: cameraAllowed && (settings.visionEnabled || settings.handGestures),
+                         eyeTracking: cameraAllowed && settings.visionEnabled,
+                         handGestures: cameraAllowed && settings.visionEnabled,
                          motionEnabled: settings.motion && !settings.focusing,
                          suppressCamera: modes.sensorsSuppressed,
                          visionPlayEnabled: cameraAllowed && settings.visionEnabled)
@@ -510,7 +549,9 @@ final class PetDirector {
         pose.lookX = strokeAttention.point.x * 70
         pose.lookY = strokeAttention.point.y * 25
         if voice.phase == .idle {
-            playback.playPettingSmile(at: now, startingAt: pose)
+            let time = now
+            playback.playPettingSmile(at: time, startingAt: pose)
+            updateAnimationCadence(at: time)
         } else {
             tapAttention = (strokeAttention.point, now + 0.65)
         }
@@ -522,6 +563,7 @@ final class PetDirector {
     }
 
     private func clearTouch() {
+        playback.resetTapSequence()
         tapAttention = nil
         strokeAttention = nil
         eyePoke = nil
@@ -532,25 +574,25 @@ final class PetDirector {
         followUp = nil
         nextAmbientAt = nil
         nextRotationAt = nil
-        rotationTapQueued = false
         refreshBaseline(interrupt: expression == .idle)
         guard expression != .idle else { return }
-        playback.react(expression, at: now, priority: .immediate)
+        let time = now
+        playback.react(expression, at: time, priority: .immediate)
+        updateAnimationCadence(at: time)
     }
 
     func expression(at time: TimeInterval) -> PetExpression {
         isPlayingMarch ? .musical : playback.expression(at: time)
     }
     func expressionVariant(at time: TimeInterval) -> PetExpressionVariant { playback.variant(at: time) }
-    func elapsed(at time: TimeInterval) -> TimeInterval {
-        isPlayingMarch ? marchElapsed(at: time) : playback.elapsed(at: time)
-    }
     func effectElapsed(at time: TimeInterval) -> TimeInterval {
         isPlayingMarch ? marchElapsed(at: time) : playback.effectElapsed(at: time)
     }
-    func expressionDuration(at time: TimeInterval) -> TimeInterval {
-        isPlayingMarch ? marchDuration : playback.expressionDuration(at: time)
+    func faceScale(at time: TimeInterval, motionEnabled: Bool) -> CGFloat {
+        guard motionEnabled, settings?.mode != .nightLight || expressionShow != nil else { return 1 }
+        return isPlayingMarch ? 1 : playback.faceScale(at: time)
     }
+
     func isPreviewingExpression(at time: TimeInterval) -> Bool { playback.isPreviewing(at: time) }
     func isPerformingExpression(at time: TimeInterval) -> Bool { playback.isPlayingRotation(at: time) }
     func glow(at time: TimeInterval) -> [PetPlayback.GlowLayer] { playback.glow(at: time) }
@@ -567,7 +609,6 @@ final class PetDirector {
         followUp = nil
         nextAmbientAt = nil
         nextRotationAt = nil
-        rotationTapQueued = false
         clearTouch()
         endPlay()
         expressionShow = (program, 0)
@@ -620,10 +661,7 @@ final class PetDirector {
         }
         var pose = motionEnabled ? playback.pose(at: time) : playback.stillPose(at: time)
         if expressionShow != nil { return pose }
-        if let eyePoke, time - eyePoke.started < 0.55 {
-            pose = PetExpression.idle.pose.blended(with: pose, progress: min(1, max(0, (time - eyePoke.started - 0.40) / 0.15)))
-            applyEyePoke(to: &pose, side: eyePoke.side, age: time - eyePoke.started, motionEnabled: motionEnabled)
-        } else if let strokeAttention, canPet {
+        if let strokeAttention, canPet {
             pose = pettingPose(strength: strokeAttention.strength)
             if motionEnabled {
                 pose.lookX = strokeAttention.point.x * 70
@@ -635,6 +673,9 @@ final class PetDirector {
             pose.lookY += gaze.y
             pose.turn = max(-1, min(1, pose.turn + gaze.x / 70))
         }
+        if let eyePoke, time - eyePoke.started < 0.55 {
+            applyEyePoke(to: &pose, side: eyePoke.side, age: time - eyePoke.started, motionEnabled: motionEnabled)
+        }
         pose.brightness *= brightness(motionEnabled: motionEnabled)
         if voice.phase == .speaking {
             pose.mouth = max(pose.mouth, 0.85)
@@ -644,8 +685,11 @@ final class PetDirector {
     }
 
     private func applyEyePoke(to pose: inout PetPose, side: EyeSide, age: TimeInterval, motionEnabled: Bool) {
-        let open = min(1, max(0, (age - 0.13) / 0.32))
-        let squeeze = CGFloat(1 - open * open * (3 - 2 * open))
+        func ease(_ value: TimeInterval) -> CGFloat {
+            let t = CGFloat(min(1, max(0, value)))
+            return t * t * (3 - 2 * t)
+        }
+        let squeeze = ease(age / 0.07) * (1 - ease((age - 0.13) / 0.32))
         let shut = EyePose(width: 0.9, height: 0.10, curve: 18, lidWeight: 8.5)
         if side == .left {
             pose.left = pose.left.blended(with: shut, progress: squeeze)
@@ -716,7 +760,8 @@ final class PetDirector {
 
         let previous = lastMotionFrame ?? (time - 1.0 / 30)
         guard time > previous else { return position }
-        let step = CGFloat(min(time - previous, 1.0 / 30))
+        // Closed-form spring: advance by real time so it settles just as fast at the idle cadence.
+        let step = CGFloat(min(time - previous, 0.2))
         lastMotionFrame = time
         let decay = exp(-18 * step)
         func advance(_ value: inout CGFloat, velocity: inout CGFloat, toward target: CGFloat) {
@@ -747,7 +792,6 @@ final class PetDirector {
             stopMarch()
             stopExpressionAudio()
             stopExpressionSoundSample()
-            rotationTapQueued = false
             completedExpressionShow = nil
         }
         let interrupt = voice.isCapturingSpeech || voice.phase == .thinking
@@ -793,7 +837,6 @@ final class PetDirector {
         followUp = nil
         nextAmbientAt = nil
         nextRotationAt = nil
-        rotationTapQueued = false
         completedExpressionShow = nil
         tapAttention = nil
         playback.playMarch(duration: duration, at: marchStartedAt)
@@ -828,6 +871,7 @@ final class PetDirector {
     }
 
     private func updateExpressionAudio(at time: TimeInterval) {
+        updateAnimationCadence(at: time)
         let preview = playback.isPreviewing(at: time) && settings?.expressionSoundsEnabled == true
         if isPreviewingExpressionAudio != preview { isPreviewingExpressionAudio = preview }
         guard let pass = playback.activeExpressionPass(at: time) else {
@@ -994,8 +1038,10 @@ final class PetDirector {
         } else {
             baseline = modes.baseline ?? (hearingMusic ? .musical : .idle)
         }
-        playback.setBaseline(baseline, at: now,
+        let time = now
+        playback.setBaseline(baseline, at: time,
                              motionStartedAt: baseline == .charging ? chargingStartedAt : nil, interrupt: interrupt)
+        updateAnimationCadence(at: time)
     }
 
     private func refreshChargingState() {
@@ -1036,7 +1082,6 @@ final class PetDirector {
 
     private func playRotation(at time: TimeInterval) {
         nextRotationAt = nil
-        rotationTapQueued = false
         playback.playRotation(rotation.nextExpression, variant: rotation.variant, at: time)
     }
 
@@ -1046,13 +1091,11 @@ final class PetDirector {
             return
         }
         guard !playback.hasActiveSelection(at: time) else { return }
-        if rotationTapQueued {
-            playRotation(at: time)
-        } else if playback.baseline == .idle {
+        if playback.baseline == .idle {
             if let nextRotationAt {
                 if time >= nextRotationAt { playRotation(at: time) }
             } else {
-                nextRotationAt = time + .random(in: 25...45)
+                nextRotationAt = time + .random(in: 3...5)
             }
         } else {
             nextRotationAt = nil
@@ -1097,7 +1140,6 @@ final class PetDirector {
         switch stimulus {
         case .faceDown:
             followUp = nil
-            rotationTapQueued = false
             updateAmbientAudio()
             voice.cancel()
             refreshBaseline(interrupt: true)

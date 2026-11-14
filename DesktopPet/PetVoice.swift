@@ -77,6 +77,7 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     @ObservationIgnored private var noiseFloor = -60.0
     @ObservationIgnored private var lastAudibleInput: ContinuousClock.Instant?
     @ObservationIgnored private var lastTranscriptChange: ContinuousClock.Instant?
+    @ObservationIgnored private var offlineMood: OfflineMood?
     @ObservationIgnored private var history: [DeepSeekClient.Message] = []
     @ObservationIgnored private var persona = Persona(model: "", name: "", personality: "")
 
@@ -171,6 +172,7 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     func begin(model: String, name: String, personality: String, greeting: String? = nil, pushToTalk: Bool = true) {
         guard canRecord else { return }
         stopWaitingForWake()
+        offlineMood = nil
         usePersona(Persona(model: model, name: name, personality: personality))
         dismissConversation()
         greetingContext = greeting
@@ -255,6 +257,7 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     }
 
     func cancel() {
+        offlineMood = nil
         conversationActive = false
         wakeStartTask?.cancel()
         wakeStartTask = nil
@@ -411,7 +414,7 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     private func startListening(id: UUID) {
         isCapturingSpeech = true
         phase = .listening
-        status = pushToTalk ? "松开发送" : (isFollowUp ? "可以接着说" : "正在听，停顿后自动发送")
+        status = pushToTalk ? "松开发送" : (isFollowUp ? "可以接着说" : "我在听。可以说说你今天的心情。")
 
         speechLimitTask = Task { [weak self] in
             let started = ContinuousClock.now
@@ -422,7 +425,7 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
                 let now = ContinuousClock.now
                 let lastInput = [self.lastAudibleInput, self.lastTranscriptChange].compactMap { $0 }.max()
                 let shouldSend = self.doubaoRecognition == nil && !self.pushToTalk && !self.transcript.isEmpty
-                    && lastInput.map { now >= $0 + .seconds(1) } == true
+                    && lastInput.map { now >= $0 + .seconds(1.5) } == true
                 let followUpTimedOut = self.isFollowUp && self.transcript.isEmpty && now >= started + .seconds(10)
                 if shouldSend || followUpTimedOut || now >= deadline {
                     self.end()
@@ -562,6 +565,7 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     }
 
     private func acceptWake(_ phrase: String, id: UUID) {
+        offlineMood = nil
         wakeCapture = .addressed
         wakeTranscript = nil
         transcript = ""
@@ -663,9 +667,9 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
             return
         }
         if let text = update.text, !text.isEmpty, text != transcript {
-            if isFollowUp && transcript.isEmpty {
-                replyText = nil
-                status = "正在听，停顿后自动发送"
+            if transcript.isEmpty {
+                if isFollowUp { replyText = nil }
+                if !pushToTalk { status = "正在听，停顿后自动发送" }
             }
             transcript = text
             lastTranscriptChange = .now
@@ -763,12 +767,23 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
             speak(localReply.text, expression: localReply.expression, command: localReply.command)
             return
         }
+        let mood = Self.mood(in: text)
         guard let key = try? KeychainStore.readAPIKey(account: .deepSeek), !key.isEmpty else {
+            if let mood {
+                respondToMood(mood)
+                return
+            }
             if let reply = Self.offlineChatReply(to: text) {
                 speak(reply, expression: .happy)
                 return
             }
-            speak("可以叫我跳舞、比个心。自由聊天可以在设置里填写 DeepSeek Key。", expression: .curious)
+            if let previous = offlineMood, isFollowUp {
+                offlineMood = nil
+                let acknowledgement = previous == .joy ? "嗯，我听着呢。你想说多少都可以。" : "我在这里，咱们慢慢来。"
+                speak(acknowledgement, expression: .listening)
+                return
+            }
+            speak("我在听。你可以说说今天的心情，也可以叫我比个心。", expression: .listening)
             return
         }
 
@@ -789,6 +804,10 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
             speak(reply, expression: expression, command: command)
         } catch {
             guard isCurrent(id) else { return }
+            if let mood {
+                respondToMood(mood)
+                return
+            }
             conversationActive = false
             switch error {
             case DeepSeekClient.RequestError.httpStatus(401):
@@ -1099,7 +1118,7 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
             用可爱的简体中文说一句话，reply 不超过 40 字。只输出一个 json 对象。
             emotion 表示最新一句中用户本人表达的情绪，结合上下文判断。只选以下一个：\(emotions)。
             明确报喜或完成值得庆祝的事选庆祝，普通开心选喜悦。转述别人的情绪、含糊或无情绪时选中性。
-            回复要贴合情绪，疲惫或难过时温柔回应，用户生气时平静理解，避免强行逗乐。
+            回复要贴合情绪。难过时先接住感受，不急着安慰成“要开心”，也不催问。用户开心时接住对方分享的具体细节，适合时只问一个自然的后续问题。疲惫时温柔回应，用户生气时平静理解。不要装作记得对方没说过的事。
             设备的电量和充电状态以系统为准，不猜测。
             只有用户明确要求设备操作时才选指令。setMode 的 value 只能是 normal、companion、battery、nightLight。
             nightLightTimer 的 value 为 15、30、60 分钟之一。countdown 的 value 为 1 到 7200 之间的秒数。
@@ -1196,6 +1215,40 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         return text.wholeMatch(of: #/(?:请问)?(?:你(?:的)?|手机(?:的)?|桌宠(?:的)?|现在|目前)*(?:充满(?:电)?了?吗|电充满了?吗|充满电(?:了)?没有|电量(?:还剩|剩下|是)?多少|还有多少电|还剩多少电|饱腹度多少|(?:正在|在)充电吗)/#) != nil
     }
 
+    private enum OfflineMood {
+        case low, joy, tired
+    }
+
+    private static func mood(in spoken: String) -> OfflineMood? {
+        let text = singleUtterance(spoken)
+        guard !spoken.contains(where: { "「」『』“”\"？?".contains($0) }) else { return nil }
+        // Match explicit descriptions of the speaker's current mood, including a following reason.
+        let prefix = #"(?:我)?(?:今天|现在|刚刚|这会儿)?(?:我)?(?:心情)?(?:觉得|有点儿?|很|好|挺|特别|真的|真|太)*"#
+        let feelings: [(OfflineMood, String)] = [
+            (.low, "(?:不(?:太|怎么)?(?:开心|高兴|快乐|舒服|好)|难过|伤心|心里不好受|心烦|低落)"),
+            (.tired, "(?:累|疲惫|疲倦)"),
+            (.joy, "(?:开心|高兴|快乐|不错|很好)")
+        ]
+        // Preserve the negation in “不太开心” instead of treating it as joy.
+        let negatedJoy = #/^(?:我)?(?:今天|现在|这会儿)?(?:我)?(?:不太|并不|没有那么)(?:开心|高兴|快乐)(?:了|[，,。；;、！!]|$)/#
+        if text.firstMatch(of: negatedJoy) != nil { return .low }
+        for (mood, phrase) in feelings {
+            let pattern = "^" + prefix + phrase + "(?:了|呀|啊|呢)?(?:[，,。；;、！!]|因为|$)"
+            if text.range(of: pattern, options: .regularExpression) != nil { return mood }
+        }
+        return nil
+    }
+
+    private func respondToMood(_ mood: OfflineMood) {
+        offlineMood = mood
+        let reply: (String, PetExpression) = switch mood {
+        case .low: ("听起来今天不好受。我陪你，你想说就说。", .affectionate)
+        case .joy: ("真好呀！是什么让你这么开心？我想听。", .happy)
+        case .tired: ("辛苦啦，想说的话我听着，也可以一起歇一会儿。", .affectionate)
+        }
+        speak(reply.0, expression: reply.1, allowCloud: false)
+    }
+
     private static func offlineChatReply(to text: String) -> String? {
         switch normalizedCommand(text) {
         case "你好", "你好呀", "嗨", "哈喽", "hi", "hello": "你好呀！我在这儿陪你。"
@@ -1207,7 +1260,6 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         case "晚上好": "晚上好！今天辛苦啦。"
         case "晚安", "睡了", "去睡了": "晚安，明天见。"
         case "谢谢", "谢谢你", "多谢": "不客气，我就在这儿。"
-        case "累了", "好累", "今天好累", "今天很累": "辛苦啦，先歇一会儿吧。"
         default: nil
         }
     }

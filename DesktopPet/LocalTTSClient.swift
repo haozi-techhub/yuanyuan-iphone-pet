@@ -14,11 +14,20 @@ nonisolated enum LocalTTSClient {
         try await engine.synthesize(text)
     }
 
+    static func releaseCachedVoice() async {
+        await engine.releaseCachedVoice()
+    }
+
     private actor Engine {
         private var tts: SherpaOnnxOfflineTtsWrapper?
+        private var idleReleaseTask: Task<Void, Never>?
 
         func synthesize(_ text: String) throws -> Data {
             try Task.checkCancellation()
+            idleReleaseTask?.cancel()
+            defer {
+                if tts != nil { scheduleIdleRelease() }
+            }
             let voice = try loadVoice()
             // The bundled voice table contains only the Mandarin speaker zf_001.
             let audio = voice.generate(text: text, sid: 0, speed: 0.94)
@@ -31,6 +40,28 @@ nonisolated enum LocalTTSClient {
             defer { try? FileManager.default.removeItem(at: file) }
             guard audio.save(filename: file.path) == 1 else { throw SynthesisError.invalidAudio }
             return try Data(contentsOf: file)
+        }
+
+        func releaseCachedVoice() {
+            idleReleaseTask?.cancel()
+            idleReleaseTask = nil
+            tts = nil
+        }
+
+        private func scheduleIdleRelease() {
+            idleReleaseTask = Task { [weak self] in
+                await self?.releaseAfterIdle()
+            }
+        }
+
+        private func releaseAfterIdle() async {
+            do {
+                try await Task.sleep(for: .seconds(30))
+                try Task.checkCancellation()
+            } catch {
+                return
+            }
+            releaseCachedVoice()
         }
 
         private func loadVoice() throws -> SherpaOnnxOfflineTtsWrapper {

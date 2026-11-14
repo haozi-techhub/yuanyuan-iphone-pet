@@ -18,14 +18,13 @@ final class SoundSense {
     @ObservationIgnored var onVoiceInterrupted: (() -> Void)?
     @ObservationIgnored var onEffectInterrupted: (() -> Void)?
 
-    @ObservationIgnored private var engine = AVAudioEngine()
+    @ObservationIgnored private var engine: AVAudioEngine?
     @ObservationIgnored private var permissionTask: Task<Void, Never>?
     @ObservationIgnored private var interruptionTask: Task<Void, Never>?
     @ObservationIgnored private var enabled = false
     @ObservationIgnored private var voiceActive = false
     @ObservationIgnored private var effectActive = false
     @ObservationIgnored private var interrupted = false
-    @ObservationIgnored private var hasInputTap = false
     @ObservationIgnored private var sessionActive = false
     @ObservationIgnored private var captureID = UUID()
     @ObservationIgnored private var detector = Detector()
@@ -89,8 +88,6 @@ final class SoundSense {
         voiceActive = true
         resetDetector()
         stopInput()
-        // Rebuild the input graph after playback may have changed the hardware format.
-        engine = AVAudioEngine()
         try startInput(makeTap: makeTap)
     }
 
@@ -159,7 +156,7 @@ final class SoundSense {
             resetDetector()
             return
         }
-        guard !hasInputTap else { return }
+        guard engine == nil else { return }
 
         do {
             let id = UUID()
@@ -192,22 +189,22 @@ final class SoundSense {
             sessionActive = true
         }
 
+        let engine = AVAudioEngine()
         let node = engine.inputNode
         let format = node.outputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else { throw AudioError.unavailable }
         node.installTap(onBus: 0, bufferSize: 512, format: format, block: try makeTap(format))
-        hasInputTap = true
+        self.engine = engine
         engine.prepare()
         try engine.start()
     }
 
     private func stopInput() {
-        guard hasInputTap else { return }
+        guard let engine else { return }
         captureID = UUID()
         if engine.isRunning { engine.stop() }
         engine.inputNode.removeTap(onBus: 0)
-        hasInputTap = false
-        engine.reset()
+        self.engine = nil
     }
 
     private func deactivateSession() {

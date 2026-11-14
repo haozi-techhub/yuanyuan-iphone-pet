@@ -164,6 +164,8 @@ enum PetExpression: String, CaseIterable, Codable, Identifiable {
         }
     }
 
+    static let quickExpressions: [Self] = [.happy, .winking, .affectionate, .delighted, .cool, .sleepy]
+
     static let groups: [(title: String, expressions: [Self])] = [
         ("日常心情", [.idle, .happy, .laughing, .angry, .proud, .sad, .crying, .surprised, .curious, .shy]),
         ("互动小动作", [.greeting, .winking, .peeking, .listening, .thinking, .confused, .kiss, .affectionate, .handHeart, .thumbsUp, .hungry, .munching]),
@@ -498,6 +500,7 @@ struct PetPlayback {
     private var baselineStart: TimeInterval = 0
     private var baselineMotionStart: TimeInterval?
     private var baselineFrom: PetPose?
+    private var baselineScaleFrom: CGFloat?
     struct GlowLayer {
         let expression: PetExpression
         let startedAt: TimeInterval
@@ -516,41 +519,47 @@ struct PetPlayback {
     private var selectionKind = SelectionKind.reaction
     private var selectionDurationOverride: TimeInterval?
     private var startPose = PetExpression.idle.pose
+    private var startScale: CGFloat = 1
     private var startTime: TimeInterval = 0
     private var tapLook = CGPoint.zero
     private var previousGlow: [GlowLayer] = []
+    static let tapBurstRelease: TimeInterval = 0.42
+
     private var lastTap: TimeInterval?
-    private var companionTapExpression = PetExpression.happy
-    private var tapIndex = 0
-    private var bonusExpressions: [PetExpression] = []
+    private var tapCount = 0
     private var userUntil: TimeInterval = 0
     private var lastReaction: TimeInterval = -.infinity
     private var usesFreezingProps = true
-    private static let bonuses: [PetExpression] = [.winking, .peeking, .kiss, .munching, .bubbles, .dancing, .handHeart, .thumbsUp, .maracas]
-    private static let tapResponses: [PetExpression] = [.happy, .greeting, .shy, .affectionate, .celebrate]
 
-    mutating func respondToTap(at time: TimeInterval, toward point: CGPoint = .zero) {
-        let continues = lastTap.map { time - $0 <= 2.0 } == true
-        let next = continues ? min(tapIndex + 1, Self.tapResponses.count) : 0
-        let expression: PetExpression
-        if next < Self.tapResponses.count {
-            expression = Self.tapResponses[next]
-        } else {
-            if bonusExpressions.isEmpty { bonusExpressions = Self.bonuses.shuffled() }
-            expression = bonusExpressions.removeLast()
-        }
-        start(expression, at: time, toward: point)
-        userUntil = time + expression.motionDuration
-        tapIndex = next
+    mutating func respondToTap(at time: TimeInterval, toward point: CGPoint = .zero) -> PetExpression {
+        if isTapBurst(at: time) { return .angry }
+        let continues = lastTap.map { time - $0 <= 1 } == true
+        tapCount = continues ? tapCount + 1 : 1
         lastTap = time
+
+        if tapCount == 8 {
+            start(.angry, at: time, kind: .tapBurst, duration: 1.85)
+            userUntil = time + selectionDuration
+            resetTapSequence()
+            return .angry
+        }
+        // Keep counting without restarting the angry animation on every poke.
+        if tapCount > 3, expression(at: time) == .angry { return .angry }
+
+        let expression: PetExpression = switch tapCount {
+        case 1: .happy
+        case 2: .surprised
+        default: .angry
+        }
+        start(expression, at: time, toward: point, kind: tapCount == 1 ? .tapSmile : .reaction,
+              duration: tapCount == 1 ? 0.94 : nil)
+        userUntil = time + selectionDuration
+        return expression
     }
 
-    mutating func respondToCompanionTap(at time: TimeInterval, toward point: CGPoint) {
-        guard !hasActiveSelection(at: time) || isPlayingAmbient(at: time) else { return }
-        let expression = companionTapExpression
-        companionTapExpression = expression == .happy ? .greeting : .happy
-        start(expression, at: time, toward: point)
-        userUntil = time + expression.motionDuration
+    mutating func resetTapSequence() {
+        tapCount = 0
+        lastTap = nil
     }
 
     mutating func playTapSmile(at time: TimeInterval, toward point: CGPoint) {
@@ -561,7 +570,7 @@ struct PetPlayback {
     mutating func show(_ expression: PetExpression, at time: TimeInterval, toward point: CGPoint = .zero) {
         start(expression, at: time, toward: point, kind: .preview)
         userUntil = time + expression.previewDuration
-        lastTap = nil
+        resetTapSequence()
     }
 
     @discardableResult
@@ -582,7 +591,22 @@ struct PetPlayback {
 
     enum ReactionPriority { case normal, immediate }
 
-    private enum SelectionKind { case reaction, preview, ambient, chargeCompletion, rotation, show, march, petting, tapSmile }
+    private enum SelectionKind {
+        case reaction, preview, ambient, chargeCompletion, rotation, show, march, petting, tapSmile, quickBrowse, tapBurst
+    }
+
+    func isTapBurst(at time: TimeInterval) -> Bool {
+        selectionKind == .tapBurst && hasActiveSelection(at: time)
+    }
+
+    mutating func playQuickExpression(_ expression: PetExpression, at time: TimeInterval) {
+        start(expression, at: time, kind: .quickBrowse)
+        userUntil = time + selectionDuration
+    }
+
+    func isBrowsing(at time: TimeInterval) -> Bool {
+        selectionKind == .quickBrowse && activeSelection(at: time) != nil
+    }
 
     mutating func playAmbient(_ expression: PetExpression, at time: TimeInterval) {
         start(expression, at: time, kind: .ambient)
@@ -644,6 +668,7 @@ struct PetPlayback {
         guard expression != baseline || motionStartedAt != baselineMotionStart || interrupt else { return }
         let blend = interrupt || activeSelection(at: time) == nil
         baselineFrom = blend ? pose(at: time) : nil
+        baselineScaleFrom = blend ? faceScale(at: time) : nil
         baselineGlow = baselineFrom.map { outgoingGlow(at: time, pose: $0) } ?? []
         if interrupt {
             selected = nil
@@ -660,8 +685,10 @@ struct PetPlayback {
                                 kind: SelectionKind = .reaction, variant: PetExpressionVariant? = nil,
                                 duration: TimeInterval? = nil) {
         startPose = pose(at: time)
+        startScale = faceScale(at: time)
         previousGlow = outgoingGlow(at: time, pose: startPose)
         baselineFrom = nil
+        baselineScaleFrom = nil
         baselineGlow = []
         startTime = time
         selected = expression
@@ -687,7 +714,10 @@ struct PetPlayback {
     }
 
     func stillPose(at time: TimeInterval) -> PetPose {
-        expression(at: time).stillPose(for: variant(at: time))
+        if isTapBurst(at: time) {
+            return tapBurstPose(at: elapsed(at: time), motionEnabled: false)
+        }
+        return expression(at: time).stillPose(for: variant(at: time))
     }
 
     func elapsed(at time: TimeInterval) -> TimeInterval {
@@ -703,8 +733,24 @@ struct PetPlayback {
         return selected.effectElapsed(at: max(0, time - pass.startedAt), playbackDuration: pass.duration)
     }
 
-    func expressionDuration(at time: TimeInterval) -> TimeInterval {
-        hasActiveSelection(at: time) ? selectionDuration : baseline.motionDuration
+    func faceScale(at time: TimeInterval) -> CGFloat {
+        let resting = Self.expressionScale(baseline)
+        guard let selected = activeSelection(at: time) else {
+            guard let baselineScaleFrom else { return resting }
+            return mix(baselineScaleFrom, resting, eased((time - baselineStart) / 0.24))
+        }
+        let age = max(0, time - startTime)
+        let entrance = eased(age / 0.24)
+        let exit = eased((selectionDuration - age) / 0.26)
+        return mix(resting, mix(startScale, Self.expressionScale(selected), entrance), exit)
+    }
+
+    private static func expressionScale(_ expression: PetExpression) -> CGFloat {
+        switch expression {
+        case .idle, .sleepy: 1
+        case .happy, .laughing, .surprised: 1.25
+        default: 1.17
+        }
     }
 
     func glow(at time: TimeInterval) -> [GlowLayer] {
@@ -718,15 +764,16 @@ struct PetPlayback {
             return outgoing + [resting]
         }
         let elapsed = max(0, time - startTime)
-        let transition = 0.15
+        let transition = entranceDuration
         let entrance = previousGlow.isEmpty ? 1 : Double(eased(elapsed / transition))
         var layers = fadedGlow(previousGlow, by: 1 - entrance)
-        if elapsed > selectionDuration - 0.42 {
-            resting.opacity = Double(eased((elapsed - selectionDuration + 0.42) / 0.42))
+        let exit = Double(eased((selectionDuration - elapsed) / 0.26))
+        if exit < 1 {
+            resting.opacity = 1 - exit
             layers.append(resting)
         }
         let pass = pass(for: selected, at: time)
-        layers.append(GlowLayer(expression: selected, startedAt: pass.startedAt, opacity: entrance,
+        layers.append(GlowLayer(expression: selected, startedAt: pass.startedAt, opacity: entrance * exit,
                                 variant: pass.variant, duration: pass.duration))
         return layers
     }
@@ -762,11 +809,17 @@ struct PetPlayback {
         let pass = pass(for: selected, at: time)
         let elapsed = max(0, time - pass.startedAt)
         let duration = pass.duration
-        if selected != .idle || baseline != .idle {
+        // Even the idle animation can end on a blink when its preview is interrupted.
+        if selected != .idle || baseline != .idle || selectionKind == .preview {
             let settle = min(0.24, duration * 0.16)
             let settleStart = duration - settle
             if elapsed > settleStart {
-                let destination = pass.variant != .third && isRotatingPreview(selected) ? PetExpression.idle.pose : resting
+                let destination = if pass.variant != .third && isRotatingPreview(selected) {
+                    PetExpression.idle.pose
+                } else {
+                    baseline.poseWithTurn(at: baselineAge(at: pass.startedAt + duration),
+                                          toward: .zero, isBaseline: true)
+                }
                 return selectedPose(selected, pass: pass, at: settleStart).blended(
                     with: destination,
                     progress: eased((elapsed - settleStart) / settle)
@@ -775,10 +828,20 @@ struct PetPlayback {
         }
 
         let target = selectedPose(selected, pass: pass, at: elapsed)
-        return startPose.blended(with: target, progress: eased((time - startTime) / 0.10))
+        return startPose.blended(with: target, progress: eased((time - startTime) / entranceDuration))
+    }
+
+    private var entranceDuration: TimeInterval {
+        switch selectionKind {
+        case .tapSmile, .tapBurst, .petting: 0.10
+        default: 0.16
+        }
     }
 
     private func selectedPose(_ expression: PetExpression, pass: Pass, at elapsed: TimeInterval) -> PetPose {
+        if selectionKind == .tapBurst {
+            return tapBurstPose(at: elapsed, motionEnabled: true)
+        }
         if selectionKind == .tapSmile {
             var pose = PetExpression.idle.pose.blended(with: expression.pose, progress: eased((elapsed - 0.19) / 0.22))
             let gaze = 1 - eased((elapsed - 0.40) / 0.30)
@@ -791,6 +854,35 @@ struct PetPlayback {
                                            variant: pass.variant)
         if expression == .freezing && !usesFreezingProps { pose.accent = .none }
         return pose
+    }
+
+    private func tapBurstPose(at age: TimeInterval, motionEnabled: Bool) -> PetPose {
+        let puffLeft = EyePose(width: 1.12, height: 0.25, tilt: 0.27, lift: 7, lidWeight: 12)
+        let puffRight = EyePose(width: 1.12, height: 0.25, tilt: -0.27, lift: 7, lidWeight: 12)
+        let puff = PetPose(left: puffLeft, right: puffRight, mouth: 1, mouthCurve: -0.7,
+                           lookY: 5, cheeks: 1, anger: 1)
+        let wideEyes = EyePose(width: 0.85, height: 1.38, lift: -8)
+        let burst = PetPose(left: wideEyes, right: wideEyes, mouth: 1, mouthOpen: 1,
+                            mouthRound: 1, bounce: motionEnabled ? -12 : 0, cheeks: 0.64, anger: 0.72)
+        let tiredEyes = EyePose(width: 1.05, height: 0.22, curve: 31, lift: 9, lidWeight: 10)
+        let tired = PetPose(left: tiredEyes, right: tiredEyes, brightness: 0.80, mouth: 1,
+                            mouthOpen: 0.48, mouthRound: 0.68, lookY: 7, cheeks: 0.26, anger: 0.08)
+        let release = Self.tapBurstRelease
+        switch age {
+        case ..<release:
+            var pose = PetExpression.angry.pose.blended(with: puff, progress: eased(age / 0.3))
+            if motionEnabled {
+                let shake = eased(age / 0.14) * (1 - eased((age - 0.30) / (release - 0.30)))
+                pose.lookX = sin(age * 46) * 4 * shake
+            }
+            return pose
+        case ..<0.59:
+            return puff.blended(with: burst, progress: eased((age - release) / 0.12))
+        case ..<0.94:
+            return burst.blended(with: tired, progress: eased((age - 0.59) / 0.35))
+        default:
+            return tired.blended(with: PetExpression.idle.pose, progress: eased((age - 1.05) / 0.56))
+        }
     }
 
     private struct Pass {
