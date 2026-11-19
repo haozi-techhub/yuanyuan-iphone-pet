@@ -54,7 +54,7 @@ nonisolated struct DeepSeekClient {
         let messages: [Message]
         let responseFormat: Option?
         let thinking = Option(type: "disabled")
-        let maxTokens = 300
+        let maxTokens: Int
 
         enum CodingKeys: String, CodingKey {
             case model, messages, thinking
@@ -80,13 +80,20 @@ nonisolated struct DeepSeekClient {
         return URLSession(configuration: config)
     }()
 
+    private static let conversationSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 1.4
+        config.timeoutIntervalForResource = 1.4
+        return URLSession(configuration: config)
+    }()
+
     private let session: URLSession
 
     init(session: URLSession? = nil) {
         self.session = session ?? Self.defaultSession
     }
 
-    func reply(apiKey: String, model: String, messages: [Message]) async throws -> Reply {
+    func reply(apiKey: String, model: String, messages: [Message], liveVoice: Bool = false) async throws -> Reply {
         var request = URLRequest(url: Self.endpoint)
         request.httpMethod = "POST"
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
@@ -94,11 +101,15 @@ nonisolated struct DeepSeekClient {
         let modelName = model.trimmingCharacters(in: .whitespacesAndNewlines)
         let model = modelName.isEmpty ? Self.defaultModel : modelName
         request.httpBody = try JSONEncoder().encode(
-            Request(model: model, messages: messages, responseFormat: .init(type: "json_object"))
+            Request(model: model, messages: messages, responseFormat: .init(type: "json_object"),
+                    maxTokens: liveVoice ? 128 : 300)
         )
 
+        if liveVoice {
+            return try await send(request, structured: true, using: Self.conversationSession)
+        }
         do {
-            return try await send(request, structured: true)
+            return try await send(request, structured: true, using: session)
         } catch RequestError.invalidResponse {
             try Task.checkCancellation()
             let plainMessages = messages.map { message in
@@ -112,13 +123,13 @@ nonisolated struct DeepSeekClient {
                 return message
             }
             request.httpBody = try JSONEncoder().encode(
-                Request(model: model, messages: plainMessages, responseFormat: nil)
+                Request(model: model, messages: plainMessages, responseFormat: nil, maxTokens: 300)
             )
-            return try await send(request, structured: false)
+            return try await send(request, structured: false, using: session)
         }
     }
 
-    private func send(_ request: URLRequest, structured: Bool) async throws -> Reply {
+    private func send(_ request: URLRequest, structured: Bool, using session: URLSession) async throws -> Reply {
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw RequestError.invalidResponse }
         guard (200..<300).contains(http.statusCode) else {

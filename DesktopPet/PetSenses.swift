@@ -364,10 +364,14 @@ private nonisolated final class CameraSense: NSObject, AVCaptureVideoDataOutputS
 
     private func prepareSession() -> AVCaptureSession? {
         dispatchPrecondition(condition: .onQueue(queue))
+#if targetEnvironment(macCatalyst)
+        let device = AVCaptureDevice.default(for: .video)
+#else
         let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front)
             ?? AVCaptureDevice.default(.builtInTrueDepthCamera, for: .video, position: .front)
             ?? AVCaptureDevice.DiscoverySession(deviceTypes: [.builtInUltraWideCamera],
                                                 mediaType: .video, position: .front).devices.first
+#endif
         guard let device, let input = try? AVCaptureDeviceInput(device: device) else { return nil }
         let session = AVCaptureSession()
         let output = AVCaptureVideoDataOutput()

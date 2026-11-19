@@ -8,7 +8,7 @@ import UserNotifications
 @Observable @MainActor
 final class PetSystemPresence {
     static let shared = PetSystemPresence()
-    static let notificationTitle = "圆圆桌宠"
+    static let notificationTitle = "圆圆吧台精灵"
     static let legacyMessageURL = URL(string: "yuanyuan-pet://message-received")!
     static let bannerPreference = "pet.messageNotificationBanners"
     static let companionPreference = "pet.liveCompanionEnabled"
@@ -22,12 +22,18 @@ final class PetSystemPresence {
     private(set) var changingCompanion = false
     private var requestingBannerPermission = false
 
+    private init() {}
+
+#if targetEnvironment(macCatalyst)
+    func refreshCompanion() {}
+    func syncCompanion(enabled: Bool, name: String) async {}
+    func openCompanion() async {}
+    nonisolated private static func updateMessageBadge(_ hasNewMessage: Bool, sourceApp: String? = nil) async -> Bool { false }
+#else
     private typealias Companion = Activity<PetLiveActivityAttributes>
     nonisolated private static var companion: Companion? {
         Companion.activities.first { $0.activityState == .active || $0.activityState == .stale }
     }
-
-    private init() {}
 
     func refreshCompanion() {
         isCompanionActive = Self.companion != nil
@@ -64,6 +70,8 @@ final class PetSystemPresence {
         }
     }
 
+#endif
+
     func receiveMessage(sourceApp: String? = nil) async throws {
         let name = sourceApp?.split(whereSeparator: \.isWhitespace).joined(separator: " ")
         let source = name.flatMap { $0.isEmpty ? nil : String($0.prefix(24)) }
@@ -82,6 +90,7 @@ final class PetSystemPresence {
         }
     }
 
+#if !targetEnvironment(macCatalyst)
     func openCompanion() async {
         guard let state = Self.companionState(), state.hasNewMessage else { return }
         messageText = state.status
@@ -107,6 +116,8 @@ final class PetSystemPresence {
         await companion.update(content)
         return true
     }
+
+#endif
 
     func openMessageBanner(text: String) async {
         messageText = text

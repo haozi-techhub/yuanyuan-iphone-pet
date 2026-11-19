@@ -3,6 +3,7 @@ import Foundation
 nonisolated struct DoubaoVoiceClient {
     static let speaker = "zh_female_tuanzi_uranus_bigtts"
     static let sampleRate = 16_000
+    static let playbackSampleRate = 24_000
 
     enum VoiceError: Error {
         case invalidResponse
@@ -72,7 +73,7 @@ nonisolated struct DoubaoVoiceClient {
         let options: [String: Any] = [
             "audio": ["format": "pcm", "codec": "raw", "rate": Self.sampleRate, "bits": 16, "channel": 1],
             "request": ["model_name": "bigmodel", "enable_itn": true, "enable_punc": true,
-                        "result_type": "full", "show_utterances": true, "enable_nonstream": true, "end_window_size": 1000]
+                        "result_type": "full", "show_utterances": true, "enable_nonstream": true, "end_window_size": 550]
         ]
         let payload = try JSONSerialization.data(withJSONObject: options)
         try await withTaskCancellationHandler {
@@ -124,6 +125,15 @@ nonisolated struct DoubaoVoiceClient {
     }
 
     func synthesize(text: String, key: String) async throws -> Data {
+        try await synthesize(text: text, key: key, format: "wav", speechRate: 0)
+    }
+
+    func streamSpeech(text: String, key: String, onAudio: @escaping @Sendable (Data) async throws -> Void) async throws {
+        _ = try await synthesize(text: text, key: key, format: "pcm", speechRate: 15, onAudio: onAudio)
+    }
+
+    private func synthesize(text: String, key: String, format: String, speechRate: Int,
+                            onAudio: (@Sendable (Data) async throws -> Void)? = nil) async throws -> Data {
         let url = URL(string: "https://openspeech.bytedance.com/api/v3/tts/unidirectional/sse")!
         var request = makeRequest(url: url, key: key, resource: "seed-tts-2.0")
         request.httpMethod = "POST"
@@ -131,15 +141,25 @@ nonisolated struct DoubaoVoiceClient {
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         request.httpBody = try JSONSerialization.data(withJSONObject: [
             "req_params": ["text": text, "speaker": Self.speaker,
-                           "audio_params": ["format": "wav", "sample_rate": 24000]]
+                           "audio_params": ["format": format, "sample_rate": Self.playbackSampleRate, "speech_rate": speechRate]]
         ])
         let (bytes, response) = try await session.bytes(for: request)
         guard let http = response as? HTTPURLResponse else { throw VoiceError.invalidResponse }
         guard (200..<300).contains(http.statusCode) else { throw VoiceError.serviceCode(http.statusCode) }
         var audio = Data()
+        var receivedAudio = false
         for try await line in bytes.lines {
+            try Task.checkCancellation()
             guard line.hasPrefix("data:") else { continue }
-            if try Self.appendAudio(line.dropFirst(5), to: &audio) { return audio }
+            let chunk = try Self.decodeAudio(line.dropFirst(5))
+            if let data = chunk.data {
+                receivedAudio = true
+                if let onAudio { try await onAudio(data) } else { audio.append(data) }
+            }
+            if chunk.finished {
+                guard receivedAudio else { throw VoiceError.invalidResponse }
+                return audio
+            }
         }
         throw VoiceError.invalidResponse
     }
@@ -152,22 +172,17 @@ nonisolated struct DoubaoVoiceClient {
         return request
     }
 
-    static func appendAudio(_ payload: Substring, to audio: inout Data) throws -> Bool {
+    private static func decodeAudio(_ payload: Substring) throws -> (data: Data?, finished: Bool) {
         let chunk = try JSONDecoder().decode(AudioChunk.self, from: Data(payload.utf8))
-        switch chunk.code {
-        case 0, 20_000_000:
-            if let data = chunk.data, !data.isEmpty {
-                guard let decoded = Data(base64Encoded: data) else { throw VoiceError.invalidResponse }
-                audio.append(decoded)
-            }
-            if chunk.code == 20_000_000 {
-                guard !audio.isEmpty else { throw VoiceError.invalidResponse }
-                return true
-            }
-            return false
-        default:
+        guard chunk.code == 0 || chunk.code == 20_000_000 else {
             throw VoiceError.serviceCode(chunk.code)
         }
+        var decoded: Data?
+        if let data = chunk.data, !data.isEmpty {
+            guard let audio = Data(base64Encoded: data) else { throw VoiceError.invalidResponse }
+            decoded = audio
+        }
+        return (decoded, chunk.code == 20_000_000)
     }
 
     static func frame(type: UInt8, serialization: UInt8, payload: Data) -> Data {

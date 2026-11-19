@@ -1130,65 +1130,61 @@ struct PetScreenGlow: View {
         .accessibilityHidden(true)
     }
 
-    @ViewBuilder
     private func outline(_ shape: some Shape, in size: CGSize) -> some View {
-        if let tintOverride {
-            let warm = gradient(color: tintOverride, highlight: nil, strength: 0.48 * tintStrength,
-                                center: .bottom, radius: max(size.width, size.height) * 0.68, tail: 0.16)
-            shape.stroke(warm, lineWidth: 2.4)
-                .background {
-                    if showsHalo {
-                        shape.stroke(warm, lineWidth: 22)
-                            .blur(radius: 15)
-                    }
+        Canvas { context, canvasSize in
+            let path = shape.path(in: CGRect(origin: .zero, size: canvasSize).insetBy(dx: edgeInset, dy: edgeInset))
+            if let tintOverride {
+                let warm = gradient(color: tintOverride, highlight: nil, strength: 0.48 * tintStrength,
+                                    center: .bottom, radius: max(size.width, size.height) * 0.68,
+                                    size: size, tail: 0.16)
+                if showsHalo {
+                    var halo = context
+                    halo.addFilter(.blur(radius: 15))
+                    halo.stroke(path, with: warm, lineWidth: 22)
                 }
-                .padding(edgeInset)
-        } else {
-            let time = motionEnabled
-                ? (isBaseline ? elapsed : expression.effectElapsed(at: elapsed, playbackDuration: playbackDuration))
-                : expression.motionDuration * 0.38
-            let frame = lighting(at: time)
-            let envelope = playbackEnvelope(at: time)
-            let gradients = frame.spots.compactMap { spot -> RadialGradient? in
-                let strength = min(1, max(0, spot.intensity * envelope))
-                guard strength > 0.004 else { return nil }
-                return gradient(color: Color(hex: spot.color), highlight: spot.highlight.map(Color.init(hex:)),
-                                strength: strength, center: edgeOrigin(in: size, near: spot.anchor, toward: spot.edge),
-                                radius: min(size.width, size.height) * spot.spread)
-            }
-
-            let ringOpacity = frame.ringOpacity * envelope
-            if !gradients.isEmpty || ringOpacity > 0.004 {
-                let ring = Color(hex: 0x92FFB6).opacity(ringOpacity)
-                strokes(shape, gradients: gradients, ring: ring, width: frame.lineWidth)
-                    .background {
-                        if showsHalo {
-                            strokes(shape, gradients: gradients, ring: ring, width: frame.haloWidth)
-                                .compositingGroup()
-                                .blur(radius: frame.blur)
+                context.stroke(path, with: warm, lineWidth: 2.4)
+            } else {
+                let time = motionEnabled
+                    ? (isBaseline ? elapsed : expression.effectElapsed(at: elapsed, playbackDuration: playbackDuration))
+                    : expression.motionDuration * 0.38
+                let frame = lighting(at: time)
+                let envelope = playbackEnvelope(at: time)
+                let gradients = frame.spots.compactMap { spot -> GraphicsContext.Shading? in
+                    let strength = min(1, max(0, spot.intensity * envelope))
+                    guard strength > 0.004 else { return nil }
+                    return gradient(color: Color(hex: spot.color), highlight: spot.highlight.map(Color.init(hex:)),
+                                    strength: strength,
+                                    center: edgeOrigin(in: size, near: spot.anchor, toward: spot.edge),
+                                    radius: min(size.width, size.height) * spot.spread, size: size)
+                }
+                let ringOpacity = frame.ringOpacity * envelope
+                guard !gradients.isEmpty || ringOpacity > 0.004 else { return }
+                let ring = GraphicsContext.Shading.color(Color(hex: 0x92FFB6).opacity(ringOpacity))
+                if showsHalo {
+                    context.drawLayer { halo in
+                        halo.addFilter(.blur(radius: frame.blur))
+                        halo.stroke(path, with: ring, lineWidth: frame.haloWidth)
+                        for gradient in gradients {
+                            halo.stroke(path, with: gradient, lineWidth: frame.haloWidth)
                         }
                     }
-                    .padding(edgeInset)
-            }
-        }
-    }
-
-    private func strokes(_ shape: some Shape, gradients: [RadialGradient], ring: Color, width: CGFloat) -> some View {
-        ZStack {
-            shape.stroke(ring, lineWidth: width)
-            ForEach(gradients.indices, id: \.self) { index in
-                shape.stroke(gradients[index], lineWidth: width)
+                }
+                context.stroke(path, with: ring, lineWidth: frame.lineWidth)
+                for gradient in gradients {
+                    context.stroke(path, with: gradient, lineWidth: frame.lineWidth)
+                }
             }
         }
     }
 
     private func gradient(color: Color, highlight: Color?, strength: Double,
-                          center: UnitPoint, radius: CGFloat, tail: Double = 0) -> RadialGradient {
-        RadialGradient(stops: [
+                          center: UnitPoint, radius: CGFloat, size: CGSize, tail: Double = 0) -> GraphicsContext.Shading {
+        .radialGradient(Gradient(stops: [
             .init(color: (highlight ?? color).opacity(strength), location: 0),
             .init(color: color.opacity(strength * 0.68), location: 0.34),
             .init(color: color.opacity(strength * tail), location: 1)
-        ], center: center, startRadius: 0, endRadius: radius)
+        ]), center: CGPoint(x: center.x * size.width, y: center.y * size.height),
+        startRadius: 0, endRadius: radius)
     }
 
     private func playbackEnvelope(at time: Double) -> Double {

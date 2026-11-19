@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		000000000000000000000087 /* PetWeather.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000086 /* PetWeather.swift */; };
 		000000000000000000000083 /* PetCompanionEye.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000085; };
 		000000000000000000000084 /* PetCompanionEye.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000085; };
 		000000000000000000000078 /* PetLiveWidget.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = 000000000000000000000077; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
@@ -64,6 +65,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		000000000000000000000086 /* PetWeather.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PetWeather.swift; sourceTree = "<group>"; };
 		000000000000000000000085 /* PetCompanionEye.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PetCompanionEye.swift; sourceTree = "<group>"; };
 		000000000000000000000079 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		000000000000000000000077 /* PetLiveWidget.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; path = PetLiveWidget.appex; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -141,6 +143,7 @@
 				00000000000000000000004A /* PetCatchGame.swift */,
 				000000000000000000000018 /* PetSenses.swift */,
 				000000000000000000000052 /* PetChat.swift */,
+				000000000000000000000086 /* PetWeather.swift */,
 				000000000000000000000051 /* PetVisionPlay.swift */,
 				000000000000000000000050 /* DoubaoVoiceClient.swift */,
 				000000000000000000000019 /* MotionSense.swift */,
@@ -279,6 +282,7 @@
 				00000000000000000000004C /* PetCatchGame.swift in Sources */,
 				000000000000000000000026 /* PetSenses.swift in Sources */,
 				000000000000000000000062 /* PetChat.swift in Sources */,
+				000000000000000000000087 /* PetWeather.swift in Sources */,
 				000000000000000000000061 /* PetVisionPlay.swift in Sources */,
 				000000000000000000000060 /* DoubaoVoiceClient.swift in Sources */,
 				000000000000000000000027 /* MotionSense.swift in Sources */,
@@ -332,7 +336,7 @@
 				DEVELOPMENT_TEAM = 4MW6855TY9;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = PetLiveWidget/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = "圆圆";
+				INFOPLIST_KEY_CFBundleDisplayName = "圆圆吧台精灵";
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.haozi.desktoppet.PetLiveWidget;
@@ -355,7 +359,7 @@
 				DEVELOPMENT_TEAM = 4MW6855TY9;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = PetLiveWidget/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = "圆圆";
+				INFOPLIST_KEY_CFBundleDisplayName = "圆圆吧台精灵";
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.haozi.desktoppet.PetLiveWidget;

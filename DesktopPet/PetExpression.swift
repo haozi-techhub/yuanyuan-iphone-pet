@@ -799,8 +799,8 @@ struct PetPlayback {
     }
 
     func pose(at time: TimeInterval) -> PetPose {
-        let resting = baseline.poseWithTurn(at: baselineAge(at: time), toward: .zero, isBaseline: true)
         guard let selected = activeSelection(at: time) else {
+            let resting = baseline.poseWithTurn(at: baselineAge(at: time), toward: .zero, isBaseline: true)
             if let baselineFrom {
                 return baselineFrom.blended(with: resting, progress: eased((time - baselineStart) / 0.24))
             }
@@ -809,26 +809,28 @@ struct PetPlayback {
         let pass = pass(for: selected, at: time)
         let elapsed = max(0, time - pass.startedAt)
         let duration = pass.duration
+        let continuesPreview = isRotatingPreview(selected) && pass.variant != .third
+        let target = selectedPose(selected, pass: pass, at: elapsed)
         // Even the idle animation can end on a blink when its preview is interrupted.
         if selected != .idle || baseline != .idle || selectionKind == .preview {
             let settle = min(0.24, duration * 0.16)
             let settleStart = duration - settle
             if elapsed > settleStart {
-                let destination = if pass.variant != .third && isRotatingPreview(selected) {
+                let destination = if continuesPreview {
                     PetExpression.idle.pose
                 } else {
                     baseline.poseWithTurn(at: baselineAge(at: pass.startedAt + duration),
                                           toward: .zero, isBaseline: true)
                 }
-                return selectedPose(selected, pass: pass, at: settleStart).blended(
+                return target.blended(
                     with: destination,
                     progress: eased((elapsed - settleStart) / settle)
                 )
             }
         }
 
-        let target = selectedPose(selected, pass: pass, at: elapsed)
-        return startPose.blended(with: target, progress: eased((time - startTime) / entranceDuration))
+        let entrancePose = pass.startedAt == startTime ? startPose : PetExpression.idle.pose
+        return entrancePose.blended(with: target, progress: eased(elapsed / entranceDuration))
     }
 
     private var entranceDuration: TimeInterval {
@@ -843,7 +845,7 @@ struct PetPlayback {
             return tapBurstPose(at: elapsed, motionEnabled: true)
         }
         if selectionKind == .tapSmile {
-            var pose = PetExpression.idle.pose.blended(with: expression.pose, progress: eased((elapsed - 0.19) / 0.22))
+            var pose = PetExpression.idle.pose.blended(with: expression.pose, progress: eased((elapsed - 0.035) / 0.18))
             let gaze = 1 - eased((elapsed - 0.40) / 0.30)
             pose.lookX = tapLook.x * gaze
             pose.lookY = tapLook.y * gaze

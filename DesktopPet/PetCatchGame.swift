@@ -143,10 +143,10 @@ struct PetCatchGame: View {
         }
     }
 
-    private var frameInterval: Double {
+    private var frameInterval: TimeInterval? {
         let constrained = reduceMotion || ProcessInfo.processInfo.isLowPowerModeEnabled
             || ProcessInfo.processInfo.thermalState == .serious || ProcessInfo.processInfo.thermalState == .critical
-        return (phase.flight != nil || drag != nil) && !constrained ? 1.0 / 60 : 1.0 / 30
+        return (phase.flight != nil || drag != nil) && !constrained ? nil : 1.0 / 30
     }
 
     private var header: some View {

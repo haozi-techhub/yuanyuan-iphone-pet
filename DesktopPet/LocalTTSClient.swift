@@ -1,5 +1,7 @@
 import Foundation
+#if !os(macOS)
 import SherpaOnnx
+#endif
 
 nonisolated enum LocalTTSClient {
     private enum SynthesisError: Error {

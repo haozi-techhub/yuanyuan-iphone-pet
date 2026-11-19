@@ -7,9 +7,19 @@ struct DesktopPetApp: App {
 
     var body: some Scene {
         WindowGroup {
+#if COURSEWARE
+            CoursewareScreen()
+#else
             PetScreen()
                 .preferredColorScheme(.dark)
+#if targetEnvironment(macCatalyst)
+                .background(MacWindowSetup())
+#endif
+#endif
         }
+#if COURSEWARE
+        .commands { CoursewareCommands() }
+#endif
     }
 }
 
@@ -33,6 +43,7 @@ struct PetScreen: View {
     @AppStorage("pet.soundReactions") private var sound = false
     @AppStorage("pet.expressionSounds") private var expressionSounds = false
     @AppStorage("pet.voiceWakeEnabled") private var voiceWakeEnabled = false
+    @AppStorage(PetWeather.cityPreference) private var weatherCity = ""
     @AppStorage("pet.deepSeekModel") private var model = DeepSeekClient.defaultModel
     @AppStorage("pet.name") private var petName = PetVoice.defaultPetName
     @AppStorage("pet.personality") private var personality = "元气"
@@ -115,7 +126,7 @@ struct PetScreen: View {
         lightweightDisplay || lowPowerMode || thermalState == .serious || thermalState == .critical
     }
 
-    private var faceFrameInterval: TimeInterval {
+    private var faceFrameInterval: TimeInterval? {
         let interactive = touchingPet || visionEnabled || motion || director.playSession != nil
         let animated = director.isAnimatingExpression || expressionShowActive || director.isPlayingMarch
             || director.voice.phase == .speaking
@@ -125,7 +136,7 @@ struct PetScreen: View {
         return usesLightweightDisplay || reduceMotion ? 1.0 / 12 : 1.0 / 30
     }
 
-    var body: some View {
+    private var stage: some View {
         GeometryReader { geometry in
             let portrait = geometry.size.height > geometry.size.width
             let insets = geometry.safeAreaInsets
@@ -140,7 +151,6 @@ struct PetScreen: View {
                 TimelineView(.animation(minimumInterval: faceFrameInterval, paused: scenePhase != .active || showControls)) { _ in
                     let now = director.now
                     let expression = director.expression(at: now)
-                    let variant = director.expressionVariant(at: now)
                     let isPreviewing = director.isPreviewingExpression(at: now)
                     let isPerforming = director.isPerformingExpression(at: now)
                     let isActing = isPerforming || expressionShowActive
@@ -152,7 +162,7 @@ struct PetScreen: View {
                     let glowOffset = CGSize(width: safeAreaOffset.width + centerOffset.width,
                                             height: safeAreaOffset.height + centerOffset.height)
                     ZStack {
-                        screenGlow(at: now, expression: expression, variant: variant, portrait: portrait, faceOffset: glowOffset,
+                        screenGlow(at: now, expression: expression, variant: director.expressionVariant(at: now), portrait: portrait, faceOffset: glowOffset,
                                    faceScale: min(art.width / 475, art.height / 215), pose: pose)
 
                         PetFace(pose: pose,
@@ -165,16 +175,23 @@ struct PetScreen: View {
                             .offset(gestureOffset)
                             .allowsHitTesting(false)
 
-                        interactionArea(expression: expression, isPreviewing: isPreviewing, isActing: isActing,
-                                        pose: pose, drawingSize: art, centerOffset: centerOffset)
-                        if let session = director.playSession {
-                            playTargets(session, at: now, in: geometry.size)
-                        }
                     }
-                    .overlay(alignment: .bottom) {
-                        if director.playSession == nil {
-                            captions(for: expression, variant: variant, isPreviewing: isPreviewing, isPerforming: isPerforming)
-                        }
+                }
+                .allowsHitTesting(false)
+
+                interactionArea()
+
+                TimelineView(.animation(minimumInterval: director.playSession == nil ? 0.2 : faceFrameInterval,
+                                        paused: scenePhase != .active || showControls)) { _ in
+                    let now = director.now
+                    if let session = director.playSession {
+                        playTargets(session, at: now, in: geometry.size)
+                    } else {
+                        captions(for: director.expression(at: now), variant: director.expressionVariant(at: now),
+                                 isPreviewing: director.isPreviewingExpression(at: now),
+                                 isPerforming: director.isPerformingExpression(at: now))
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                            .allowsHitTesting(false)
                     }
                 }
 
@@ -235,13 +252,32 @@ struct PetScreen: View {
             }
             .onChange(of: geometry.size, initial: true) { _, _ in director.updateOrientation() }
         }
-        .accessibilityHidden(showControls)
+    }
+
+    private var panelStage: some View {
+        stage.accessibilityHidden(showControls)
+#if COURSEWARE
+        .overlay {
+            if let activePanel {
+                controls(activePanel)
+                    .preferredColorScheme(.dark)
+            }
+        }
+        .onChange(of: activePanel) { previous, current in
+            if previous != nil, current == nil { playPendingSelection() }
+        }
+#else
         .sheet(item: $activePanel, onDismiss: playPendingSelection) { panel in
             controls(panel)
                 .preferredColorScheme(.dark)
                 .presentationDragIndicator(.visible)
                 .presentationDetents([.large])
         }
+#endif
+    }
+
+    var body: some View {
+        panelStage
         .onOpenURL { url in
             if url == PetSystemPresence.legacyMessageURL {
                 Task { await previewMessageReminder() }
@@ -736,10 +772,20 @@ struct PetScreen: View {
         }
     }
 
-    private func interactionArea(expression: PetExpression, isPreviewing: Bool, isActing: Bool,
-                                 pose: PetPose, drawingSize: CGSize, centerOffset: CGSize) -> some View {
+    private func interactionArea() -> some View {
         GeometryReader { geometry in
+            let labelTime = director.now
+            let expression = director.expression(at: labelTime)
+            let isPreviewing = director.isPreviewingExpression(at: labelTime)
+            let isActing = director.isPerformingExpression(at: labelTime) || expressionShowActive
             PetTouchSurface { event in
+                let time = director.now
+                let portrait = geometry.size.height > geometry.size.width
+                let pose = director.pose(at: time, motionEnabled: !reduceMotion)
+                let drawingSize = faceDrawingSize(in: geometry.size, portrait: portrait,
+                                                  emphasis: director.faceScale(at: time, motionEnabled: !reduceMotion))
+                let centerOffset = faceOffset(director.travel(at: time, motionEnabled: !reduceMotion),
+                                              in: geometry.size, art: drawingSize, portrait: portrait)
                 switch event {
                 case .contact(let active):
                     touchingPet = active
@@ -1325,6 +1371,9 @@ struct PetScreen: View {
 
     private var systemPresenceSettings: some View {
         settingsSection("灵动岛与消息提醒") {
+#if targetEnvironment(macCatalyst)
+            settingsNote("灵动岛与锁屏实时活动仅在 iPhone 上提供。")
+#else
             Toggle("灵动岛陪伴", isOn: $liveCompanion)
                 .onChange(of: liveCompanion) { _, enabled in
                     Task { await systemPresence.syncCompanion(enabled: enabled, name: displayName) }
@@ -1336,6 +1385,7 @@ struct PetScreen: View {
                     .foregroundStyle(.secondary)
             }
             settingsNote("有灵动岛的机型可在岛上看到圆圆，其他支持实时活动的机型可在锁屏查看。")
+#endif
             Text("刘海屏预览")
                 .font(.subheadline.weight(.semibold))
             notchEyePreview
@@ -1595,6 +1645,15 @@ struct PetScreen: View {
             settingsNote("验证会发送一小段静音和固定试听文本。主动录音和云端播报由火山引擎处理。")
             Link("打开豆包语音 API Key 管理",
                  destination: URL(string: "https://console.volcengine.com/speech/new/setting/apikeys?projectName=default")!)
+                .font(.footnote)
+            Divider()
+            TextField("默认天气城市（选填）", text: $weatherCity)
+                .textFieldStyle(.roundedBorder)
+            settingsNote("可以说「台北明天天气怎么样」。未填默认城市时，圆圆会问你要查哪里。")
+            Link("预报经圆圆整理，数据来自 MET Norway（CC BY 4.0）",
+                 destination: URL(string: "https://docs.api.met.no/doc/License.html")!)
+                .font(.footnote)
+            Link("城市搜索来自 Open-Meteo / GeoNames", destination: URL(string: "https://open-meteo.com/en/docs/geocoding-api")!)
                 .font(.footnote)
             if director.audio.microphoneDenied { permissionLink("麦克风权限未开启") }
             if director.voice.speechPermissionDenied && (!director.voice.hasDoubaoKey || voiceWakeEnabled) {

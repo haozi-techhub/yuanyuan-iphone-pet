@@ -2,7 +2,7 @@ import ActivityKit
 import AppIntents
 import Foundation
 
-nonisolated struct PetLiveActivityAttributes: ActivityAttributes {
+nonisolated struct PetLiveActivityAttributes {
     struct ContentState: Codable, Hashable {
         enum Reaction: String, Codable {
             case happy, wink, curious
@@ -37,6 +37,9 @@ nonisolated struct PetLiveActivityAttributes: ActivityAttributes {
     static let openURL = URL(string: "yuanyuan-pet://live-activity")!
 }
 
+#if !targetEnvironment(macCatalyst)
+nonisolated extension PetLiveActivityAttributes: nonisolated ActivityAttributes {}
+
 nonisolated struct PetLookAroundIntent: LiveActivityIntent {
     static let title: LocalizedStringResource = "逗一下圆圆"
     static let isDiscoverable = false
@@ -54,3 +57,4 @@ nonisolated struct PetLookAroundIntent: LiveActivityIntent {
         return .result()
     }
 }
+#endif

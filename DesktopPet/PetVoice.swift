@@ -1,12 +1,14 @@
 @preconcurrency import AVFoundation
 import Foundation
 import Observation
+import OSLog
 @preconcurrency import Speech
 
 @MainActor
 @Observable
 final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelegate {
     static let defaultPetName = "圆圆"
+    private static let latencyLog = Logger(subsystem: Bundle.main.bundleIdentifier ?? "DesktopPet", category: "VoiceLatency")
 
     enum Phase: Equatable {
         case idle, authorizing, listening, thinking, speaking
@@ -57,7 +59,9 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     @ObservationIgnored private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "zh-CN"))
     @ObservationIgnored private let synthesizer = AVSpeechSynthesizer()
     @ObservationIgnored private var player: AVAudioPlayer?
-    @ObservationIgnored private var localPlaybackText: String?
+    @ObservationIgnored private var cloudPlayer: StreamingVoicePlayer?
+    @ObservationIgnored private var captureEndedAt: ContinuousClock.Instant?
+    @ObservationIgnored private var playbackBegan = false
     @ObservationIgnored private var outputTask: Task<Void, Never>?
     @ObservationIgnored private var pendingCommand: Command?
     @ObservationIgnored private var speechRequest: SFSpeechAudioBufferRecognitionRequest?
@@ -77,6 +81,8 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     @ObservationIgnored private var noiseFloor = -60.0
     @ObservationIgnored private var lastAudibleInput: ContinuousClock.Instant?
     @ObservationIgnored private var lastTranscriptChange: ContinuousClock.Instant?
+    @ObservationIgnored private var pendingWeatherPeriod: PetWeather.Period?
+    @ObservationIgnored private var lastWeatherCity: String?
     @ObservationIgnored private var offlineMood: OfflineMood?
     @ObservationIgnored private var history: [DeepSeekClient.Message] = []
     @ObservationIgnored private var persona = Persona(model: "", name: "", personality: "")
@@ -173,6 +179,8 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         guard canRecord else { return }
         stopWaitingForWake()
         offlineMood = nil
+        pendingWeatherPeriod = nil
+        lastWeatherCity = nil
         usePersona(Persona(model: model, name: name, personality: personality))
         dismissConversation()
         greetingContext = greeting
@@ -237,6 +245,8 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         }
         wakeSilenceTask?.cancel()
         wakeSilenceTask = nil
+        captureEndedAt = .now
+        playbackBegan = false
         phase = .thinking
         status = "让我想想…"
         speechLimitTask?.cancel()
@@ -249,7 +259,11 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         } else {
             speechLimitTask = Task { [weak self] in
                 guard let self else { return }
-                let timeout: Duration = self.doubaoRecognition == nil ? .seconds(1.2) : .seconds(5)
+                let timeout: Duration = if self.transcript.isEmpty {
+                    self.doubaoRecognition == nil ? .seconds(1.2) : .seconds(2)
+                } else {
+                    self.doubaoRecognition == nil ? .milliseconds(350) : .milliseconds(500)
+                }
                 do { try await Task.sleep(for: timeout) } catch { return }
                 self.submitTranscript(id: id)
             }
@@ -257,6 +271,8 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     }
 
     func cancel() {
+        pendingWeatherPeriod = nil
+        lastWeatherCity = nil
         offlineMood = nil
         conversationActive = false
         wakeStartTask?.cancel()
@@ -425,7 +441,7 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
                 let now = ContinuousClock.now
                 let lastInput = [self.lastAudibleInput, self.lastTranscriptChange].compactMap { $0 }.max()
                 let shouldSend = self.doubaoRecognition == nil && !self.pushToTalk && !self.transcript.isEmpty
-                    && lastInput.map { now >= $0 + .seconds(1.5) } == true
+                    && lastInput.map { now >= $0 + .milliseconds(750) } == true
                 let followUpTimedOut = self.isFollowUp && self.transcript.isEmpty && now >= started + .seconds(10)
                 if shouldSend || followUpTimedOut || now >= deadline {
                     self.end()
@@ -624,6 +640,7 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     }
 
     private func endWithStatus(_ status: String) {
+        captureEndedAt = nil
         conversationActive = false
         isHeld = false
         phase = .idle
@@ -718,6 +735,7 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         let text = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else {
             if isFollowUp {
+                captureEndedAt = nil
                 conversationActive = false
                 audio.finishVoice()
                 phase = .idle
@@ -762,11 +780,13 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
             return
         }
         if let localReply = Self.localReply(to: text) {
+            pendingWeatherPeriod = nil
             rememberTurn(user: contextualText, reply: localReply.text)
             if case .play = localReply.command { conversationActive = false }
             speak(localReply.text, expression: localReply.expression, command: localReply.command)
             return
         }
+        if await replyToWeather(text, id: id) { return }
         let mood = Self.mood(in: text)
         guard let key = try? KeychainStore.readAPIKey(account: .deepSeek), !key.isEmpty else {
             if let mood {
@@ -790,14 +810,14 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         let user = DeepSeekClient.Message(role: "user", content: contextualText)
         let messages = [DeepSeekClient.Message(role: "system", content: persona.prompt)] + history + [user]
         do {
-            let response = try await client.reply(apiKey: key, model: persona.model, messages: messages)
+            let response = try await client.reply(apiKey: key, model: persona.model, messages: messages, liveVoice: true)
             guard isCurrent(id) else { return }
             let command = Self.validate(response.command, spoken: text)
             if let type = response.command?.type, type != "none", command == .none {
                 speak("我没确认你想让我做什么，再说一次吧。", expression: .confused)
                 return
             }
-            let reply = String(response.reply.trimmingCharacters(in: .whitespacesAndNewlines).prefix(40))
+            let reply = String(response.reply.trimmingCharacters(in: .whitespacesAndNewlines).prefix(24))
             let emotion = response.emotion.flatMap { Emotion(rawValue: $0.trimmingCharacters(in: .whitespacesAndNewlines)) }
             let expression = command == .none ? (emotion ?? .neutral).expression : .happy
             rememberTurn(user: contextualText, reply: reply)
@@ -806,6 +826,10 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
             guard isCurrent(id) else { return }
             if let mood {
                 respondToMood(mood)
+                return
+            }
+            if (error as? URLError)?.code == .timedOut {
+                speak("这次没接上。", expression: .listening)
                 return
             }
             conversationActive = false
@@ -827,6 +851,42 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         }
     }
 
+    private func replyToWeather(_ spoken: String, id: UUID) async -> Bool {
+        let text = Self.simplified(spoken)
+        let pending = pendingWeatherPeriod
+        pendingWeatherPeriod = nil
+        let query = PetWeather.query(in: text) ?? pending.flatMap { period in
+            PetWeather.cityName(in: text).map { PetWeather.Query(city: $0, period: period) }
+        }
+        guard let query else { return false }
+
+        let savedCity = UserDefaults.standard.string(forKey: PetWeather.cityPreference)
+            .flatMap { PetWeather.cityName(in: Self.simplified($0)) }
+        guard let city = query.city ?? lastWeatherCity ?? savedCity else {
+            pendingWeatherPeriod = query.period
+            speak("你想查哪个城市？", expression: .listening)
+            return true
+        }
+
+        status = "正在查\(city)的天气…"
+        let reply: String
+        do {
+            reply = try await PetWeather.fetch(city: city, period: query.period)
+            guard isCurrent(id) else { return true }
+            lastWeatherCity = city
+        } catch PetWeather.LookupError.cityNotFound {
+            guard isCurrent(id) else { return true }
+            pendingWeatherPeriod = query.period
+            reply = "没找到\(city)，换个城市名试试。"
+        } catch {
+            guard isCurrent(id) else { return true }
+            reply = "天气暂时查不到，等会儿再试。"
+        }
+        rememberTurn(user: spoken, reply: reply)
+        speak(reply, expression: .listening)
+        return true
+    }
+
     private func rememberTurn(user: String, reply: String) {
         history.append(contentsOf: [.init(role: "user", content: user), DeepSeekClient.Reply(reply: reply).historyMessage])
         history = Array(history.suffix(16))
@@ -843,10 +903,10 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         captionTask?.cancel()
         turnID = UUID()
         transcript = ""
-        speak(text, expression: .greeting, allowCloud: false)
+        speak(text, expression: .greeting)
     }
 
-    private func speak(_ text: String, expression: PetExpression, command: Command = .none, allowCloud: Bool = true) {
+    private func speak(_ text: String, expression: PetExpression, command: Command = .none) {
         status = nil
         replyText = text
         phase = .speaking
@@ -855,37 +915,81 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         case .face: break // The face action starts when the reply audio is ready.
         default: onReplyExpression?(expression)
         }
-        playVoice(text, allowCloud: allowCloud)
+        playVoice(text)
     }
 
-    private func playVoice(_ text: String, allowCloud: Bool = true) {
+    private func playVoice(_ text: String) {
         voiceOutputNotice = nil
         let id = turnID
-        let cloudKey = allowCloud ? try? KeychainStore.readAPIKey(account: .doubao) : nil
+        let cloudKey = try? KeychainStore.readAPIKey(account: .doubao)
         let client = doubao
+
         outputTask = Task { [weak self] in
-            let cloudAudio: Data?
             if let cloudKey {
-                cloudAudio = try? await client.synthesize(text: text, key: cloudKey)
-            } else {
-                cloudAudio = nil
+                do {
+                    try await client.streamSpeech(text: text, key: cloudKey) { [weak self] chunk in
+                        guard let self else { throw CancellationError() }
+                        try await self.enqueueCloudSpeech(chunk, id: id)
+                    }
+                    guard let self, self.isCurrent(id) else { return }
+                    self.outputTask = nil
+                    self.cloudPlayer?.finish()
+                } catch {
+                    guard let self, self.isCurrent(id) else { return }
+                    self.outputTask = nil
+                    let message = self.cloudPlayer == nil
+                        ? "团子音色暂时无法播报，可重播这条回复。"
+                        : "团子音色播报中断，可重播这条回复。"
+                    self.voiceOutputNotice = message
+                    self.conversationActive = false
+                    if !self.isPreviewing { self.status = message }
+                    if let cloudPlayer = self.cloudPlayer {
+                        cloudPlayer.finish()
+                    } else {
+                        self.presentReply()
+                        self.finishSpeaking()
+                    }
+                }
+                return
             }
-            guard !Task.isCancelled else { return }
-            let data: Data?
-            if let cloudAudio {
-                data = cloudAudio
-            } else {
-                data = try? await LocalTTSClient.synthesize(text: text)
-            }
+
+            let data = try? await LocalTTSClient.synthesize(text: text)
             guard let self, self.isCurrent(id) else { return }
             self.outputTask = nil
-            if data == nil {
-                self.noteVoicePackFallback()
-            } else if cloudKey != nil, cloudAudio == nil {
-                self.voiceOutputNotice = "豆包语音播报暂不可用，已使用离线音色。"
-            }
+            if data == nil { self.noteVoicePackFallback() }
             self.startPlayback(text, audioData: data)
         }
+    }
+
+    private func enqueueCloudSpeech(_ data: Data, id: UUID) throws {
+        guard isCurrent(id) else { throw CancellationError() }
+        if let cloudPlayer {
+            try cloudPlayer.enqueue(data)
+            return
+        }
+        try audio.prepareVoicePlayback()
+        let player = try StreamingVoicePlayer { [weak self] in
+            guard let self, self.isCurrent(id) else { return }
+            self.finishSpeaking(resumeConversation: true)
+        }
+        do {
+            try player.enqueue(data)
+        } catch {
+            player.stop()
+            throw error
+        }
+        cloudPlayer = player
+        mouthOpen = 0.45
+        recordPlaybackStart()
+        schedulePlaybackLimit()
+        presentReply()
+    }
+
+    private func recordPlaybackStart() {
+        guard let captureEndedAt, !playbackBegan else { return }
+        playbackBegan = true
+        let elapsed = captureEndedAt.duration(to: .now)
+        Self.latencyLog.info("Capture stop to playback start: \(elapsed.description, privacy: .public)")
     }
 
     private func startPlayback(_ text: String, audioData: Data? = nil) {
@@ -901,7 +1005,6 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
 
         if let audioData {
             if startLocalPlayback(audioData) {
-                localPlaybackText = text
                 schedulePlaybackLimit()
                 presentReply()
                 return
@@ -946,6 +1049,7 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         player.volume = 1
         player.prepareToPlay()
         guard player.play() else { return false }
+        recordPlaybackStart()
         let session = AVAudioSession.sharedInstance()
         if session.outputVolume == 0 {
             status = "媒体音量为零，请按音量加键。"
@@ -989,6 +1093,14 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     }
 
     private func finishSpeaking(resumeConversation: Bool = false) {
+        if let captureEndedAt, playbackBegan, resumeConversation {
+            let elapsed = captureEndedAt.duration(to: .now)
+            Self.latencyLog.info("Capture stop to playback end: \(elapsed.description, privacy: .public)")
+        }
+        captureEndedAt = nil
+        playbackBegan = false
+        cloudPlayer?.stop()
+        cloudPlayer = nil
         outputTask?.cancel()
         outputTask = nil
         let command = pendingCommand
@@ -1006,7 +1118,7 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
             let id = turnID
             phase = .authorizing
             followUpTask = Task { [weak self] in
-                do { try await Task.sleep(for: .milliseconds(350)) } catch { return }
+                do { try await Task.sleep(for: .milliseconds(180)) } catch { return }
                 guard let self, self.isCurrent(id), self.conversationActive else { return }
                 self.followUpTask = nil
                 guard self.canContinueConversation?() == true else {
@@ -1032,7 +1144,6 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         player?.delegate = nil
         player?.stop()
         player = nil
-        localPlaybackText = nil
     }
 
     private func expireCaption() {
@@ -1056,6 +1167,7 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         let id = ObjectIdentifier(utterance)
         Task { @MainActor [weak self] in
             guard let self, self.utteranceID == id else { return }
+            self.recordPlaybackStart()
             self.mouthOpen = 0.78
             self.mouthTask?.cancel()
             self.mouthTask = Task { [weak self] in
@@ -1084,14 +1196,9 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     private nonisolated func notifyPlayerFinished(_ id: ObjectIdentifier, successfully: Bool) {
         Task { @MainActor [weak self] in
             guard let self, let player = self.player, ObjectIdentifier(player) == id else { return }
-            if !successfully, let text = self.localPlaybackText {
-                self.stopLocalPlayback()
-                self.speechLimitTask?.cancel()
-                self.mouthTask?.cancel()
-                self.mouthOpen = 0
-                self.noteVoicePackFallback()
-                self.startPlayback(text)
-                return
+            if !successfully {
+                self.voiceOutputNotice = "播报中断，可重播这条回复。"
+                if !self.isPreviewing { self.status = self.voiceOutputNotice }
             }
             self.finishSpeaking(resumeConversation: successfully)
         }
@@ -1115,7 +1222,8 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
             let emotions = Emotion.allCases.map(\.rawValue).joined(separator: "、")
             return """
             你是桌宠，名字是「\(petName.isEmpty ? PetVoice.defaultPetName : String(petName.prefix(32)))」，性格是「\(style.isEmpty ? "元气" : String(style.prefix(100)))」。
-            用可爱的简体中文说一句话，reply 不超过 40 字。只输出一个 json 对象。
+            用可爱的简体中文说一句话，reply 尽量在 12 个字内，最多 24 个字。只输出一个 json 对象。
+            实时天气只在近期对话已有明确天气查询结果时引用，禁止猜测气温或天气。
             emotion 表示最新一句中用户本人表达的情绪，结合上下文判断。只选以下一个：\(emotions)。
             明确报喜或完成值得庆祝的事选庆祝，普通开心选喜悦。转述别人的情绪、含糊或无情绪时选中性。
             回复要贴合情绪。难过时先接住感受，不急着安慰成“要开心”，也不催问。用户开心时接住对方分享的具体细节，适合时只问一个自然的后续问题。疲惫时温柔回应，用户生气时平静理解。不要装作记得对方没说过的事。
@@ -1184,7 +1292,8 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
                 let phrase = String(String.UnicodeScalarView(remainder.unicodeScalars.drop(while: separators.contains)))
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 if phrase.isEmpty || remainder.unicodeScalars.first.map(separators.contains) == true
-                    || isMarchRequest(phrase) || isBatteryQuestion(phrase) || localReply(to: phrase) != nil {
+                    || isMarchRequest(phrase) || isBatteryQuestion(phrase) || localReply(to: phrase) != nil
+                    || PetWeather.query(in: phrase) != nil {
                     return phrase
                 }
             }
@@ -1246,7 +1355,7 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         case .joy: ("真好呀！是什么让你这么开心？我想听。", .happy)
         case .tired: ("辛苦啦，想说的话我听着，也可以一起歇一会儿。", .affectionate)
         }
-        speak(reply.0, expression: reply.1, allowCloud: false)
+        speak(reply.0, expression: reply.1)
     }
 
     private static func offlineChatReply(to text: String) -> String? {
@@ -1402,5 +1511,67 @@ final class PetVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         case "分钟", "分鐘", "分": return amount * 60
         default: return amount
         }
+    }
+}
+
+
+@MainActor
+private final class StreamingVoicePlayer {
+    private let engine = AVAudioEngine()
+    private let node = AVAudioPlayerNode()
+    private let format: AVAudioFormat
+    private let onDrained: () -> Void
+    private var queuedBuffers = 0
+    private var finished = false
+
+    init(onDrained: @escaping () -> Void) throws {
+        guard let format = AVAudioFormat(standardFormatWithSampleRate: Double(DoubaoVoiceClient.playbackSampleRate),
+                                         channels: 1) else {
+            throw DoubaoVoiceClient.VoiceError.invalidResponse
+        }
+        self.format = format
+        self.onDrained = onDrained
+        engine.attach(node)
+        engine.connect(node, to: engine.mainMixerNode, format: format)
+        try engine.start()
+    }
+
+    func enqueue(_ pcm: Data) throws {
+        let sampleCount = pcm.count / 2
+        guard sampleCount > 0, pcm.count.isMultiple(of: 2),
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(sampleCount)),
+              let samples = buffer.floatChannelData?[0] else {
+            throw DoubaoVoiceClient.VoiceError.invalidResponse
+        }
+        buffer.frameLength = AVAudioFrameCount(sampleCount)
+        pcm.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
+            for index in 0..<sampleCount {
+                let value = bytes.loadUnaligned(fromByteOffset: index * 2, as: Int16.self)
+                samples[index] = Float(Int16(littleEndian: value)) / 32_768
+            }
+        }
+        queuedBuffers += 1
+        node.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.queuedBuffers -= 1
+                self.drainIfReady()
+            }
+        }
+        if !node.isPlaying { node.play() }
+    }
+
+    func finish() {
+        finished = true
+        drainIfReady()
+    }
+
+    func stop() {
+        node.stop()
+        engine.stop()
+    }
+
+    private func drainIfReady() {
+        if finished && queuedBuffers == 0 { onDrained() }
     }
 }
